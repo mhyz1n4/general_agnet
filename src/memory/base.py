@@ -94,6 +94,38 @@ class BaseIndexer(ABC):
         """
         pass
 
+    @abstractmethod
+    def find_by_content_hash(self, content_hash: str) -> Optional[str]:
+        """
+        Return the key of any existing entry whose metadata contains a matching
+        content_hash, or None if no match is found.
+
+        This is the correct abstraction for deduplication — MemoryManager
+        calls this instead of inspecting the indexer's internal data structures.
+
+        Args:
+            content_hash: The hex content hash to search for.
+
+        Returns:
+            The key of the matching entry, or None.
+        """
+        pass
+
+    @abstractmethod
+    def touch(self, key: str) -> None:
+        """
+        Refresh the stored timestamp on an existing index entry without changing
+        its content or keywords.  Called by MemoryManager when a duplicate write
+        is detected so that the entry's recency stays current.
+
+        Args:
+            key: Unique identifier of the entry to update.
+
+        Returns:
+            None (silently no-ops if key does not exist).
+        """
+        pass
+
 
 class BaseRetriever(ABC):
     """

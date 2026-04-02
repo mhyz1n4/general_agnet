@@ -92,19 +92,22 @@ class MemoryManager:
         """
         metadata = metadata or {}
 
-        # Content-hash deduplication
+        # Content-hash deduplication — uses the BaseIndexer interface only,
+        # no access to implementation-private methods.
         content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
         try:
-            index = self.indexer._load_index()  # type: ignore[attr-defined]
-            for existing_key, entry in index.items():
-                if entry.get("metadata", {}).get("content_hash") == content_hash:
-                    logger.debug(
-                        "save_message dedup: skipping duplicate content",
-                        extra={"data": {"message_id": message_id, "matches": existing_key}},
-                    )
-                    return
+            existing_key = self.indexer.find_by_content_hash(content_hash)
+            if existing_key is not None:
+                # Refresh the timestamp so the entry stays current in any
+                # recency-based ranking, as documented in the class docstring.
+                self.indexer.touch(existing_key)
+                logger.debug(
+                    "save_message dedup: duplicate content, timestamp refreshed",
+                    extra={"data": {"message_id": message_id, "matches": existing_key}},
+                )
+                return
         except Exception:
-            # If we can't load the index, proceed without dedup
+            # Dedup is best-effort; proceed with the write on any indexer error.
             pass
 
         metadata = {**metadata, "content_hash": content_hash}

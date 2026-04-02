@@ -11,7 +11,8 @@ from src.memory.base import SearchResult
 def components():
     storage = MagicMock()
     indexer = MagicMock()
-    indexer._load_index.return_value = {}
+    # Default: no duplicate found — proceed with write
+    indexer.find_by_content_hash.return_value = None
     retriever = MagicMock()
     return storage, indexer, retriever
 
@@ -66,26 +67,26 @@ def test_get_context_backward_compat(mm, components):
 
 def test_dedup_same_content_skips_second_save(components):
     storage, indexer, retriever = components
-    # First save: index empty
-    indexer._load_index.return_value = {}
     mm = MemoryManager(storage=storage, indexer=indexer, retriever=retriever)
-    mm.save_message("m1", "hello world", {"type": "semantic"})
 
-    # Second save: index now contains the hash from first save
-    import hashlib
-    content_hash = hashlib.sha256("hello world".encode()).hexdigest()[:16]
-    indexer._load_index.return_value = {
-        "m1": {"metadata": {"content_hash": content_hash}}
-    }
+    # First save: no duplicate
+    mm.save_message("m1", "hello world", {"type": "semantic"})
+    assert storage.save.call_count == 1
+
+    # Second save with identical content: find_by_content_hash returns the existing key
+    indexer.find_by_content_hash.return_value = "m1"
     mm.save_message("m2", "hello world", {"type": "semantic"})
 
-    # storage.save should only have been called once
+    # storage.save must NOT be called a second time
     assert storage.save.call_count == 1
+    # touch must be called to refresh the timestamp
+    indexer.touch.assert_called_once_with("m1")
 
 
 def test_dedup_different_content_both_saved(components):
     storage, indexer, retriever = components
-    indexer._load_index.return_value = {}
+    # find_by_content_hash always returns None — no duplicates
+    indexer.find_by_content_hash.return_value = None
     mm = MemoryManager(storage=storage, indexer=indexer, retriever=retriever)
     mm.save_message("m1", "content A", {})
     mm.save_message("m2", "content B", {})
@@ -98,7 +99,8 @@ def test_dedup_different_content_both_saved(components):
 
 def test_save_failure_enqueues_to_dlq(components):
     storage, indexer, retriever = components
-    indexer._load_index.return_value = {}
+    # No duplicate: proceed to storage.save which will fail
+    indexer.find_by_content_hash.return_value = None
     storage.save.side_effect = OSError("disk full")
 
     dlq = MagicMock()
@@ -114,7 +116,7 @@ def test_save_failure_enqueues_to_dlq(components):
 
 def test_save_failure_without_dlq_raises(components):
     storage, indexer, retriever = components
-    indexer._load_index.return_value = {}
+    indexer.find_by_content_hash.return_value = None
     storage.save.side_effect = OSError("disk full")
 
     mm = MemoryManager(storage=storage, indexer=indexer, retriever=retriever)
