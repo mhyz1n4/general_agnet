@@ -1,0 +1,142 @@
+[
+  {
+    "id": "g001",
+    "user_input": "Remember that I prefer dark mode in all my editors.",
+    "expected_intent": "general_task",
+    "expected_tool": "memorize",
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g002",
+    "user_input": "Save this: I work best in the morning between 8-10am.",
+    "expected_intent": "general_task",
+    "expected_tool": "memorize",
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g003",
+    "user_input": "Note that my team uses Python 3.11 for all backend services.",
+    "expected_intent": "general_task",
+    "expected_tool": "memorize",
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g004",
+    "user_input": "What did I tell you about my preferences?",
+    "expected_intent": "recall_history",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": ["semantic"]
+  },
+  {
+    "id": "g005",
+    "user_input": "What did we discuss yesterday?",
+    "expected_intent": "recall_history",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g006",
+    "user_input": "What was in our last session?",
+    "expected_intent": "current_session",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g007",
+    "user_input": "How do I set up a Python virtual environment?",
+    "expected_intent": "general_task",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g008",
+    "user_input": "What's the best way to write unit tests in Python?",
+    "expected_intent": "general_task",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g009",
+    "user_input": "Please remember: my database is hosted on AWS RDS in us-east-1.",
+    "expected_intent": "general_task",
+    "expected_tool": "memorize",
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g010",
+    "user_input": "What did I say about my database setup?",
+    "expected_intent": "recall_history",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": ["semantic"]
+  },
+  {
+    "id": "g011",
+    "user_input": "Remind me what we talked about in the last 3 days.",
+    "expected_intent": "recall_history",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g012",
+    "user_input": "Save the procedure for deploying to production: run make deploy then verify health endpoint.",
+    "expected_intent": "general_task",
+    "expected_tool": "memorize",
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g013",
+    "user_input": "How do I deploy to production?",
+    "expected_intent": "general_task",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": ["procedural"]
+  },
+  {
+    "id": "g014",
+    "user_input": "What are my editor preferences?",
+    "expected_intent": "recall_history",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": ["semantic"]
+  },
+  {
+    "id": "g015",
+    "user_input": "Can you summarise what you know about me?",
+    "expected_intent": "general_task",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": ["semantic"]
+  },
+  {
+    "id": "g016",
+    "user_input": "Note that I'm allergic to peanuts.",
+    "expected_intent": "general_task",
+    "expected_tool": "memorize",
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g017",
+    "user_input": "What happened last week?",
+    "expected_intent": "recall_history",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g018",
+    "user_input": "What is the capital of France?",
+    "expected_intent": "general_task",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g019",
+    "user_input": "Write a haiku about memory.",
+    "expected_intent": "general_task",
+    "expected_tool": null,
+    "expected_memory_keys_retrieved": []
+  },
+  {
+    "id": "g020",
+    "user_input": "Remember: I prefer tabs over spaces in Go code.",
+    "expected_intent": "general_task",
+    "expected_tool": "memorize",
+    "expected_memory_keys_retrieved": []
+  }
+]

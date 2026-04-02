@@ -5,6 +5,18 @@ python-dotenv>=1.0.0
 pydantic>=2.0.0
 redis>=5.0.0
 
+# Agent framework
+strands-agents[anthropic]>=0.1.0
+
+# Config & settings
+pydantic-settings>=2.0.0
+
+# Templating
+jinja2>=3.1.0
+
+# Terminal UI
+rich>=13.0.0
+
 # Optional: For testing and development
 pytest>=8.0.0
 black>=24.0.0
