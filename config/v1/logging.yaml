@@ -1,0 +1,15 @@
+version: v1
+
+# -----------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------
+level: INFO          # DEBUG | INFO | WARNING | ERROR | CRITICAL
+path: ./logs/app.jsonl
+
+# Rotation: delete oldest files when the log directory exceeds this size.
+max_dir_bytes: 524288000  # 500 MB
+
+# Fields included in every structured JSON log line:
+#   timestamp, level, trace_id, component, event, data
+# Adding or removing fields requires a change to _JsonFormatter in
+# src/logging_config.py.

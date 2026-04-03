@@ -4,6 +4,9 @@ Structured JSON logging for the agent system.
 Every log record is emitted as a single JSON line with fields:
   {timestamp, level, trace_id, component, event, data}
 
+Configuration is loaded from config/v1/logging.yaml.  Values can be
+overridden at runtime by passing explicit arguments to get_logger().
+
 Usage:
     from src.logging_config import get_logger, set_trace_id
 
@@ -18,19 +21,50 @@ import os
 import sys
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
+import yaml
+
+_CONFIG_V1 = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "v1")
+_LOGGING_YAML = os.path.join(_CONFIG_V1, "logging.yaml")
 
 _trace_id: ContextVar[str] = ContextVar("trace_id", default="unset")
 
 
 def set_trace_id(value: str) -> None:
-    """Set the trace ID for the current context (per-turn UUID)."""
+    """Set the trace ID for the current async context (one UUID per turn)."""
     _trace_id.set(value)
 
 
 def get_trace_id() -> str:
     return _trace_id.get()
 
+
+# ---------------------------------------------------------------------------
+# YAML loader
+# ---------------------------------------------------------------------------
+
+def _load_logging_yaml(path: str = _LOGGING_YAML) -> Dict[str, Any]:
+    """
+    Load logging defaults from config/v1/logging.yaml.
+
+    Returns an empty dict if the file is missing or unparseable so that
+    get_logger() can still fall back to hardcoded defaults.
+    """
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        raw.pop("version", None)
+        return raw
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Formatter
+# ---------------------------------------------------------------------------
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -48,16 +82,22 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(log_obj)
 
 
+# ---------------------------------------------------------------------------
+# One-time root logger configuration
+# ---------------------------------------------------------------------------
+
 _configured = False
 
 
-def _configure(log_path: str = "./logs/app.jsonl", log_level: str = "INFO") -> None:
+def _configure(log_path: str, log_level: str) -> None:
     global _configured
     if _configured:
         return
     _configured = True
 
-    os.makedirs(os.path.dirname(log_path) if os.path.dirname(log_path) else ".", exist_ok=True)
+    log_dir = os.path.dirname(log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
 
     level = getattr(logging, log_level.upper(), logging.INFO)
     root = logging.getLogger()
@@ -76,7 +116,29 @@ def _configure(log_path: str = "./logs/app.jsonl", log_level: str = "INFO") -> N
     root.addHandler(stderr_handler)
 
 
-def get_logger(component: str, log_path: str = "./logs/app.jsonl", log_level: str = "INFO") -> logging.Logger:
-    """Return a logger for the given component, configuring the root logger once."""
-    _configure(log_path, log_level)
+def get_logger(
+    component: str,
+    log_path: Optional[str] = None,
+    log_level: Optional[str] = None,
+) -> logging.Logger:
+    """
+    Return a named logger, configuring the root logger once on first call.
+
+    Values resolve in this order:
+      1. Explicit ``log_path`` / ``log_level`` arguments.
+      2. config/v1/logging.yaml (``path`` / ``level`` keys).
+      3. Hardcoded defaults (``./logs/app.jsonl`` / ``INFO``).
+
+    Args:
+        component: Logger name, typically ``__name__``.
+        log_path:  Override the log file path from YAML/defaults.
+        log_level: Override the log level from YAML/defaults.
+
+    Returns:
+        A configured ``logging.Logger`` instance.
+    """
+    yaml_cfg = _load_logging_yaml()
+    resolved_path = log_path or yaml_cfg.get("path", "./logs/app.jsonl")
+    resolved_level = log_level or yaml_cfg.get("level", "INFO")
+    _configure(resolved_path, resolved_level)
     return logging.getLogger(component)

@@ -47,18 +47,32 @@ def test_config_defaults_applied(monkeypatch):
     assert cfg.dlq_max_attempts == 3
 
 
-@pytest.mark.parametrize("missing_field", ["LLM_MODEL", "LLM_API_KEY", "MEMORY_ROOT", "INDEX_PATH"])
-def test_config_missing_required_field_raises(monkeypatch, missing_field):
+def test_config_missing_api_key_raises(monkeypatch):
+    """LLM_API_KEY has no YAML default — must always come from env / .env."""
+    from src.config import Config
+
+    env = _make_env(exclude=["LLM_API_KEY"])
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+
+    with pytest.raises(ValidationError):
+        Config(_env_file=None)
+
+
+@pytest.mark.parametrize("missing_field", ["LLM_MODEL", "MEMORY_ROOT", "INDEX_PATH"])
+def test_config_yaml_provides_default_for_field(monkeypatch, missing_field):
+    """Fields present in app.yaml resolve from YAML even when env var is absent."""
     from src.config import Config
 
     env = _make_env(exclude=[missing_field])
     for k, v in env.items():
         monkeypatch.setenv(k, v)
-    # Clear the missing field explicitly
     monkeypatch.delenv(missing_field, raising=False)
 
-    with pytest.raises(ValidationError):
-        Config(_env_file=None)
+    # Should NOT raise — YAML provides the default
+    cfg = Config(_env_file=None)
+    assert cfg is not None
 
 
 def test_config_custom_optional_values(monkeypatch):

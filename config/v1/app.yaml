@@ -1,0 +1,43 @@
+version: v1
+
+# -----------------------------------------------------------------------
+# LLM
+# llm_api_key is intentionally absent — supply via LLM_API_KEY env var
+# or .env file. Never commit secrets to version-controlled YAML.
+# -----------------------------------------------------------------------
+llm_model: claude-sonnet-4-6
+llm_max_tokens: 1024
+
+# -----------------------------------------------------------------------
+# Memory (file system)
+# -----------------------------------------------------------------------
+memory_root: ./memory
+index_path: ./memory/index.json
+
+# -----------------------------------------------------------------------
+# Redis (short-term session memory)
+# -----------------------------------------------------------------------
+redis_host: localhost
+redis_port: 6379
+redis_ttl: 3600
+session_max_messages: 100
+
+# -----------------------------------------------------------------------
+# Session behaviour
+# -----------------------------------------------------------------------
+session_inactivity_timeout_seconds: 300
+tool_timeout_seconds: 10
+max_context_chars: 8000
+
+# -----------------------------------------------------------------------
+# Logging  (overridden by config/v1/logging.yaml for log-specific detail)
+# -----------------------------------------------------------------------
+log_path: ./logs/app.jsonl
+log_level: INFO
+
+# -----------------------------------------------------------------------
+# Dead-letter queue
+# -----------------------------------------------------------------------
+dlq_path: ./memory/dlq.jsonl
+dlq_max_attempts: 3
+dlq_retry_interval_seconds: 60
