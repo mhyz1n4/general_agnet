@@ -15,14 +15,23 @@ reduced-capability mode (no Redis), or success=False if it must abort.
 import logging
 import os
 import shutil
-from typing import Any, Optional
+from typing import Optional
 
+import redis as redis_lib
+
+from src.client.base import LLMClient
+from src.constants import (
+    DEFAULT_AGENT_MODEL,
+    LLM_PING_MAX_TOKENS,
+    LOG_DIR_MAX_BYTES,
+    SESSION_LOG_SUBDIR_PREFIX,
+    WRITE_TEST_CONTENT,
+    WRITE_TEST_FILENAME,
+)
 from src.logging_config import get_logger
 from .base import BaseHook, HookResult
 
 logger = get_logger(__name__)
-
-_LOG_DIR_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
 
 
 class PreSessionHook(BaseHook):
@@ -31,16 +40,18 @@ class PreSessionHook(BaseHook):
     def __init__(
         self,
         memory_root: str,
-        redis_client: Optional[Any] = None,
-        llm_client: Optional[Any] = None,
+        redis_client: Optional[redis_lib.Redis] = None,
+        llm_client: Optional[LLMClient] = None,
+        llm_model: str = DEFAULT_AGENT_MODEL,
         log_dir: str = "./logs",
     ) -> None:
         self.memory_root = memory_root
         self.redis_client = redis_client
         self.llm_client = llm_client
+        self.llm_model = llm_model
         self.log_dir = log_dir
 
-    def run(self, **kwargs: Any) -> HookResult:
+    def run(self, **kwargs: object) -> HookResult:
         logger.debug("pre_session: starting health checks")
         issues: list[str] = []
         degraded = False
@@ -88,11 +99,20 @@ class PreSessionHook(BaseHook):
     # ------------------------------------------------------------------
 
     def _check_filesystem(self) -> bool:
+        """
+        Verify that the memory root directory is writable.
+
+        Creates the directory if it does not exist, then performs a
+        write-and-delete test to confirm the filesystem is not read-only.
+
+        Returns:
+            ``True`` if the directory is writable; ``False`` otherwise.
+        """
         try:
             os.makedirs(self.memory_root, exist_ok=True)
-            test_path = os.path.join(self.memory_root, ".write_test")
+            test_path = os.path.join(self.memory_root, WRITE_TEST_FILENAME)
             with open(test_path, "w") as f:
-                f.write("ok")
+                f.write(WRITE_TEST_CONTENT)
             os.unlink(test_path)
             logger.debug("pre_session: filesystem check passed")
             return True
@@ -104,6 +124,16 @@ class PreSessionHook(BaseHook):
             return False
 
     def _check_redis(self) -> bool:
+        """
+        Ping Redis to verify connectivity.
+
+        If no ``redis_client`` is configured, Redis is treated as absent
+        rather than failed — the method returns ``True`` immediately.
+
+        Returns:
+            ``True`` if Redis is reachable or not configured; ``False`` on
+            any connection or command error.
+        """
         if self.redis_client is None:
             return True  # Redis not configured — not a failure
         try:
@@ -118,14 +148,27 @@ class PreSessionHook(BaseHook):
             return False
 
     def _check_llm(self) -> str:
-        """Returns 'ok', 'auth_error', or 'rate_limit'."""
+        """
+        Perform a lightweight LLM API ping to validate the API key.
+
+        If no ``llm_client`` is configured the check is skipped and ``'ok'``
+        is returned.  Exception classification is based on the exception
+        class name so it works across different provider SDKs.
+
+        Returns:
+            ``'ok'``         — API key is valid (or no client configured).
+            ``'auth_error'`` — Authentication failed; session cannot start.
+            ``'rate_limit'`` — Rate-limited at startup; session can continue
+                               in degraded mode.
+        """
         if self.llm_client is None:
             return "ok"
         try:
             # Lightweight ping — one token completion
             self.llm_client.completion(
                 messages=[{"role": "user", "content": "ping"}],
-                max_tokens=1,
+                model=self.llm_model,
+                max_tokens=LLM_PING_MAX_TOKENS,
             )
             logger.debug("pre_session: LLM check passed")
             return "ok"
@@ -150,27 +193,55 @@ class PreSessionHook(BaseHook):
             return "ok"
 
     def _rotate_logs(self) -> None:
-        """Delete oldest log files if the log directory exceeds 500 MB."""
+        """
+        Evict old log entries when the log directory exceeds the size cap.
+
+        Scans ``self.log_dir`` for:
+          - Session subdirectories (``session_*``) — deleted as a whole unit
+            to preserve per-session log integrity.
+          - Legacy root-level files — deleted individually (backward compat).
+
+        Entries are sorted by modification time (oldest first) and removed
+        until the total size is at or below ``LOG_DIR_MAX_BYTES``.  Errors
+        are logged at WARNING and do not abort the session.
+        """
         if not os.path.isdir(self.log_dir):
             return
         try:
-            files = [
-                (os.path.getmtime(os.path.join(self.log_dir, f)), os.path.join(self.log_dir, f))
-                for f in os.listdir(self.log_dir)
-                if os.path.isfile(os.path.join(self.log_dir, f))
-            ]
-            total = sum(os.path.getsize(p) for _, p in files)
-            if total <= _LOG_DIR_MAX_BYTES:
+            entries: list[tuple[float, str, int, bool]] = []  # (mtime, path, size, is_dir)
+            total = 0
+
+            for name in os.listdir(self.log_dir):
+                path = os.path.join(self.log_dir, name)
+                if os.path.isfile(path):
+                    size = os.path.getsize(path)
+                    entries.append((os.path.getmtime(path), path, size, False))
+                    total += size
+                elif os.path.isdir(path) and name.startswith(SESSION_LOG_SUBDIR_PREFIX):
+                    size = sum(
+                        os.path.getsize(os.path.join(dp, f))
+                        for dp, _, fnames in os.walk(path)
+                        for f in fnames
+                    )
+                    entries.append((os.path.getmtime(path), path, size, True))
+                    total += size
+
+            if total <= LOG_DIR_MAX_BYTES:
                 return
 
-            files.sort()  # oldest first
-            for _, path in files:
-                if total <= _LOG_DIR_MAX_BYTES:
+            entries.sort()  # oldest first
+            for _, path, size, is_dir in entries:
+                if total <= LOG_DIR_MAX_BYTES:
                     break
-                size = os.path.getsize(path)
-                os.unlink(path)
+                if is_dir:
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.unlink(path)
                 total -= size
-                logger.info("pre_session: deleted old log file", extra={"data": {"path": path}})
+                logger.info(
+                    "pre_session: rotated old logs",
+                    extra={"data": {"path": path, "is_dir": is_dir}},
+                )
         except Exception as exc:
             logger.warning(
                 "pre_session: log rotation failed",

@@ -1,8 +1,11 @@
 """
 Integration tests for hooks against real Redis and filesystem.
-LLM client is mocked.
+
+LLM client is mocked throughout; only Redis and the filesystem are real.
+Start Redis on port 6380 with ``make test-infra-start`` before running.
 """
 
+import json
 import os
 import time
 import pytest
@@ -20,17 +23,18 @@ pytestmark = pytest.mark.integration
 REDIS_TEST_PORT = 6380
 
 
-@pytest.fixture
-def mem_root(tmp_path):
-    return str(tmp_path / "memory")
+# mem_root and mem_stack come from tests/integration/conftest.py
 
 
 @pytest.fixture
-def full_mm(mem_root):
-    storage = TypedMarkdownStorage(memory_root=mem_root)
-    indexer = JSONIndexer(index_path=os.path.join(mem_root, "index.json"))
-    retriever = KeywordRetriever(indexer=indexer)
-    return MemoryManager(storage=storage, indexer=indexer, retriever=retriever)
+def full_mm(mem_stack):
+    """
+    MemoryManager from the shared mem_stack, alias for hooks tests.
+
+    Using the shared ``mem_stack`` fixture avoids duplicating the
+    storage/indexer/retriever setup across multiple test files.
+    """
+    return mem_stack["manager"]
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +42,7 @@ def full_mm(mem_root):
 # ---------------------------------------------------------------------------
 
 def test_pre_session_all_healthy(mem_root, clean_redis):
+    """PreSessionHook reports success and no degradation when Redis is up."""
     import redis
     hook = PreSessionHook(
         memory_root=mem_root,
@@ -49,6 +54,7 @@ def test_pre_session_all_healthy(mem_root, clean_redis):
 
 
 def test_pre_session_redis_wrong_port(mem_root):
+    """PreSessionHook degrades gracefully when Redis is unreachable."""
     import redis
     hook = PreSessionHook(
         memory_root=mem_root,
@@ -65,10 +71,10 @@ def test_pre_session_redis_wrong_port(mem_root):
 # ---------------------------------------------------------------------------
 
 def test_post_session_flushes_redis_to_fs(mem_root, clean_redis, tmp_path):
-    import redis, json
+    """Messages pre-populated in Redis must appear as .md files after hook runs."""
     from datetime import datetime, timezone
 
-    redis_client = redis.Redis(port=REDIS_TEST_PORT, decode_responses=True)
+    redis_client = clean_redis  # already flushed, live connection on port 6380
 
     # Pre-populate Redis with 3 messages
     for i in range(3):
@@ -76,13 +82,16 @@ def test_post_session_flushes_redis_to_fs(mem_root, clean_redis, tmp_path):
         data = {
             "id": msg_id,
             "content": f"session message {i}",
-            "metadata": {"type": "episodic", "timestamp": datetime.now(timezone.utc).isoformat()},
+            "metadata": {
+                "type": "episodic",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
         }
         redis_client.set(f"mem:{msg_id}", json.dumps(data), ex=60)
 
     storage = TypedMarkdownStorage(memory_root=mem_root)
     indexer = JSONIndexer(index_path=os.path.join(mem_root, "index.json"))
-    retriever = KeywordRetriever(indexer=indexer)
+    retriever = KeywordRetriever(index_path=os.path.join(mem_root, "index.json"), storage=storage)
     mm = MemoryManager(storage=storage, indexer=indexer, retriever=retriever)
 
     mock_llm = MagicMock()
@@ -103,24 +112,23 @@ def test_post_session_flushes_redis_to_fs(mem_root, clean_redis, tmp_path):
     # Give daemon thread time to complete
     time.sleep(1.0)
 
-    # All 3 messages should now be in the filesystem
     md_files = []
     for root, dirs, files in os.walk(mem_root):
         for f in files:
             if f.endswith(".md"):
                 md_files.append(f)
 
-    # At least the 3 flushed + 1 summary
+    # Expect at least the 3 flushed messages
     assert len(md_files) >= 3
 
 
 def test_post_session_llm_mock_summary_saved(mem_root, clean_redis, tmp_path):
-    import redis
+    """PostSessionHook must persist the LLM-generated session summary to disk."""
+    redis_client = clean_redis
 
-    redis_client = redis.Redis(port=REDIS_TEST_PORT, decode_responses=True)
     storage = TypedMarkdownStorage(memory_root=mem_root)
     indexer = JSONIndexer(index_path=os.path.join(mem_root, "index.json"))
-    retriever = KeywordRetriever(indexer=indexer)
+    retriever = KeywordRetriever(index_path=os.path.join(mem_root, "index.json"), storage=storage)
     mm = MemoryManager(storage=storage, indexer=indexer, retriever=retriever)
 
     mock_llm = MagicMock()
@@ -138,10 +146,10 @@ def test_post_session_llm_mock_summary_saved(mem_root, clean_redis, tmp_path):
     hook.run(metrics={"turns": [{"user": "hello", "assistant": "hi"}]})
     time.sleep(0.5)
 
-    # Summary saved as episodic md in conversations/
+    # Summary must be written to conversations/ as session_<id>.md
     conv_dir = os.path.join(mem_root, "conversations")
-    found = False
-    for root, dirs, files in os.walk(conv_dir):
-        if "session_sum-session.md" in files:
-            found = True
+    found = any(
+        "session_sum-session.md" in files
+        for _, _, files in os.walk(conv_dir)
+    )
     assert found

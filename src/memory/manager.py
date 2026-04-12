@@ -7,9 +7,18 @@ indexing, and retrieval strategies to provide a unified interface for agent memo
 
 import hashlib
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .base import BaseStorage, BaseIndexer, BaseRetriever, SearchResult
+from .types import MemoryMetadata, StorageRecord
+from src.constants import (
+    CONTENT_HASH_LENGTH,
+    CONTEXT_BLOCK_DELIMITER,
+    DEFAULT_RETRIEVAL_LIMIT,
+    DEFAULT_SESSION_MAX_MESSAGES,
+    INTENT_CURRENT_SESSION,
+    INTENT_RECALL_HISTORY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +49,11 @@ class MemoryManager:
         indexer: BaseIndexer,
         retriever: BaseRetriever,
         session_storage: Optional[BaseStorage] = None,
-        classifier: Optional[Any] = None,
-        temporal_extractor: Optional[Any] = None,
-        dlq: Optional[Any] = None,
+        classifier: Optional["RegexClassifier"] = None,
+        temporal_extractor: Optional["TemporalExtractor"] = None,
+        dlq: Optional["DeadLetterQueue"] = None,
+        session_max_messages: int = DEFAULT_SESSION_MAX_MESSAGES,
+        session_id: Optional[str] = None,
     ):
         """
         Initialize the MemoryManager with its core components.
@@ -55,6 +66,11 @@ class MemoryManager:
             classifier: Optional query intent classifier (RegexClassifier).
             temporal_extractor: Optional temporal range extractor (TemporalExtractor).
             dlq: Optional DeadLetterQueue for failed save retries.
+            session_max_messages: Maximum messages to keep in session_storage before
+                evicting the oldest entry to long-term storage.
+            session_id: Current session identifier. When provided, session eviction
+                only considers keys whose stored metadata.session_id matches, so
+                concurrent sessions do not evict each other's entries.
         """
         self.storage: BaseStorage = storage
         self.indexer: BaseIndexer = indexer
@@ -63,6 +79,9 @@ class MemoryManager:
         self.classifier = classifier
         self.temporal_extractor = temporal_extractor
         self.dlq = dlq
+        self.session_max_messages = session_max_messages
+        self.session_id: Optional[str] = session_id
+        self.eviction_count: int = 0
 
     # ------------------------------------------------------------------
     # Write
@@ -72,7 +91,7 @@ class MemoryManager:
         self,
         message_id: str,
         content: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[MemoryMetadata] = None,
     ) -> None:
         """
         Save a message into long-term storage and update its search index.
@@ -94,7 +113,7 @@ class MemoryManager:
 
         # Content-hash deduplication — uses the BaseIndexer interface only,
         # no access to implementation-private methods.
-        content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+        content_hash = hashlib.sha256(content.encode()).hexdigest()[:CONTENT_HASH_LENGTH]
         try:
             existing_key = self.indexer.find_by_content_hash(content_hash)
             if existing_key is not None:
@@ -112,7 +131,7 @@ class MemoryManager:
 
         metadata = {**metadata, "content_hash": content_hash}
 
-        data: Dict[str, Any] = {
+        data: StorageRecord = {
             "id": message_id,
             "content": content,
             "metadata": metadata,
@@ -121,6 +140,7 @@ class MemoryManager:
             self.storage.save(message_id, data)
             self.indexer.add(message_id, content, metadata)
             if self.session_storage is not None:
+                self._enforce_session_limit()
                 self.session_storage.save(message_id, data)
             logger.debug(
                 "save_message: saved and indexed",
@@ -136,10 +156,84 @@ class MemoryManager:
             raise
 
     # ------------------------------------------------------------------
+    # Session eviction
+    # ------------------------------------------------------------------
+
+    def _enforce_session_limit(self) -> None:
+        """
+        Evict the oldest session message to long-term storage when the session
+        window is at capacity. Runs synchronously before each new session write.
+
+        When ``session_id`` is set, only keys whose stored metadata.session_id
+        matches are counted and evicted — this prevents concurrent sessions from
+        evicting each other's entries from shared session storage.
+        """
+        if self.session_storage is None:
+            return
+        try:
+            all_keys: List[str] = self.session_storage.list_keys()
+
+            # Collect only the keys that belong to the current session (when known).
+            # Keys with no matching session_id are left untouched so concurrent
+            # sessions do not interfere with each other.
+            session_keys: List[str] = []
+            for key in all_keys:
+                if self.session_id is not None:
+                    record = self.session_storage.load(key)
+                    if record is None:
+                        continue
+                    if record.get("metadata", {}).get("session_id") != self.session_id:
+                        continue
+                session_keys.append(key)
+
+            if len(session_keys) < self.session_max_messages:
+                return
+
+            # Find the oldest key by timestamp in stored metadata.
+            # Keys with no timestamp sort to the front (empty string < any ISO-8601).
+            oldest_key: Optional[str] = None
+            oldest_ts: str = "~"  # "~" sorts after all valid ISO-8601 strings
+            for key in session_keys:
+                record = self.session_storage.load(key)
+                if record is None:
+                    continue
+                ts = record.get("metadata", {}).get("timestamp", "")
+                if ts < oldest_ts:
+                    oldest_ts = ts
+                    oldest_key = key
+
+            if oldest_key is None:
+                return
+
+            record = self.session_storage.load(oldest_key)
+            if record is not None:
+                # Write to long-term storage directly — bypass dedup and DLQ
+                # to avoid recursion; this is a best-effort eviction path.
+                try:
+                    self.storage.save(oldest_key, record)
+                    self.indexer.add(oldest_key, record["content"], record["metadata"])
+                except Exception as exc:
+                    logger.error(
+                        "session_eviction: long-term write failed",
+                        extra={"data": {"key": oldest_key, "error": str(exc)}},
+                    )
+            self.session_storage.delete(oldest_key)
+            self.eviction_count += 1
+            logger.debug(
+                "session_eviction: evicted oldest entry to long-term storage",
+                extra={"data": {"key": oldest_key, "eviction_count": self.eviction_count}},
+            )
+        except Exception as exc:
+            logger.error(
+                "session_eviction: unexpected error",
+                extra={"data": {"error": str(exc)}},
+            )
+
+    # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
 
-    def get_context_with_keys(self, query: str, limit: int = 3) -> Tuple[str, List[str]]:
+    def get_context_with_keys(self, query: str, limit: int = DEFAULT_RETRIEVAL_LIMIT) -> Tuple[str, List[str]]:
         """
         Retrieve relevant context blocks from memory based on a query.
 
@@ -153,11 +247,11 @@ class MemoryManager:
             intent = self.classifier.classify(query)
             intent_value: str = getattr(intent, "value", "")
 
-            if intent_value == "current_session":
+            if intent_value == INTENT_CURRENT_SESSION:
                 logger.debug("CURRENT_SESSION intent — session search not supported in v1.")
                 return "", []
 
-            if intent_value == "recall_history" and self.temporal_extractor is not None:
+            if intent_value == INTENT_RECALL_HISTORY and self.temporal_extractor is not None:
                 time_range = self.temporal_extractor.extract(query)
                 if time_range:
                     logger.debug(
@@ -171,13 +265,13 @@ class MemoryManager:
             return "", []
 
         context_blocks: List[str] = [
-            f"--- Context (Key: {r.key}) ---\n{r.content}\n"
+            f"{CONTEXT_BLOCK_DELIMITER}\n{r.content}\n"
             for r in results
         ]
         keys = [r.key for r in results]
         return "\n".join(context_blocks), keys
 
-    def get_context(self, query: str, limit: int = 3) -> str:
+    def get_context(self, query: str, limit: int = DEFAULT_RETRIEVAL_LIMIT) -> str:
         """
         Retrieve relevant context blocks from memory based on a query.
 

@@ -4,12 +4,18 @@ version: v1
 # Logging
 # -----------------------------------------------------------------------
 level: INFO          # DEBUG | INFO | WARNING | ERROR | CRITICAL
-path: ./logs/app.jsonl
 
-# Rotation: delete oldest files when the log directory exceeds this size.
-max_dir_bytes: 524288000  # 500 MB
+# Rotation: delete oldest session subdirs when the log directory exceeds
+# this size.  Change LOG_DIR_MAX_BYTES in src/constants.py to adjust.
+# max_dir_bytes is read from src/constants.LOG_DIR_MAX_BYTES (500 MB).
 
-# Fields included in every structured JSON log line:
+# Files written per session under logs/session_{id}_{YYYY-MM-DD}/:
+#   app.jsonl     - orchestrator, hooks, client, main
+#   memory.jsonl  - src.memory.*
+#   agent.jsonl   - src.agents.*, src.tools.*
+#   metrics.jsonl - session metrics (written by PostSessionHook)
+
+# Fields in every structured JSON log line:
 #   timestamp, level, trace_id, component, event, data
 # Adding or removing fields requires a change to _JsonFormatter in
 # src/logging_config.py.

@@ -6,8 +6,10 @@ ensuring consistency across different implementations of the memory system.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field
+
+from .types import IndexEntry, MemoryMetadata, StorageRecord
 
 
 class SearchResult(BaseModel):
@@ -23,64 +25,72 @@ class SearchResult(BaseModel):
     key: str
     content: str
     relevance_score: float
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    metadata: MemoryMetadata = Field(default_factory=dict)
 
 
 class BaseStorage(ABC):
-    """
-    Abstract base class for data storage implementations.
-    """
+    """Abstract base class for data storage implementations."""
 
     @abstractmethod
-    def save(self, key: str, data: Any) -> None:
+    def save(self, key: str, data: StorageRecord) -> None:
         """
-        Save data to the storage backend.
+        Save a storage record to the backend.
 
         Args:
             key: Unique identifier for the data.
-            data: The content to be stored. Can be any serializable object.
-
-        Returns:
-            None
+            data: The StorageRecord to persist.
         """
-        pass
 
     @abstractmethod
-    def load(self, key: str) -> Optional[Any]:
+    def load(self, key: str) -> Optional[StorageRecord]:
         """
-        Load data from the storage backend.
+        Load a storage record from the backend.
 
         Args:
             key: Unique identifier for the data.
 
         Returns:
-            The stored data if found, otherwise None.
+            The StorageRecord if found, otherwise None.
         """
-        pass
+
+    @abstractmethod
+    def list_keys(self) -> List[str]:
+        """
+        Return all stored keys.
+
+        Returns:
+            A list of every key currently in the backend.
+        """
+
+    @abstractmethod
+    def delete(self, key: str) -> bool:
+        """
+        Delete the entry for the given key.
+
+        Args:
+            key: Unique identifier for the data.
+
+        Returns:
+            True if the key existed and was deleted, False otherwise.
+        """
 
 
 class BaseIndexer(ABC):
-    """
-    Abstract base class for content indexing implementations.
-    """
+    """Abstract base class for content indexing implementations."""
 
     @abstractmethod
-    def add(self, key: str, content: str, metadata: Dict[str, Any]) -> None:
+    def add(self, key: str, content: str, metadata: MemoryMetadata) -> None:
         """
         Index new content for future retrieval.
 
         Args:
             key: Unique identifier for the content.
             content: The text content to be indexed.
-            metadata: Additional structured data associated with the content.
-
-        Returns:
-            None
+            metadata: Structured metadata associated with the content.
         """
-        pass
 
     @abstractmethod
-    def update(self, key: str, content: str, metadata: Dict[str, Any]) -> None:
+    def update(self, key: str, content: str, metadata: MemoryMetadata) -> None:
         """
         Update an existing index entry.
 
@@ -88,11 +98,7 @@ class BaseIndexer(ABC):
             key: Unique identifier for the existing content.
             content: The updated text content.
             metadata: The updated metadata.
-
-        Returns:
-            None
         """
-        pass
 
     @abstractmethod
     def find_by_content_hash(self, content_hash: str) -> Optional[str]:
@@ -100,37 +106,26 @@ class BaseIndexer(ABC):
         Return the key of any existing entry whose metadata contains a matching
         content_hash, or None if no match is found.
 
-        This is the correct abstraction for deduplication — MemoryManager
-        calls this instead of inspecting the indexer's internal data structures.
-
         Args:
             content_hash: The hex content hash to search for.
 
         Returns:
             The key of the matching entry, or None.
         """
-        pass
 
     @abstractmethod
     def touch(self, key: str) -> None:
         """
         Refresh the stored timestamp on an existing index entry without changing
-        its content or keywords.  Called by MemoryManager when a duplicate write
-        is detected so that the entry's recency stays current.
+        its content or keywords.
 
         Args:
             key: Unique identifier of the entry to update.
-
-        Returns:
-            None (silently no-ops if key does not exist).
         """
-        pass
 
 
 class BaseRetriever(ABC):
-    """
-    Abstract base class for memory retrieval implementations.
-    """
+    """Abstract base class for memory retrieval implementations."""
 
     @abstractmethod
     def search(self, query: str, limit: int = 5) -> List[SearchResult]:
@@ -144,4 +139,3 @@ class BaseRetriever(ABC):
         Returns:
             A list of SearchResult objects, ranked by relevance.
         """
-        pass

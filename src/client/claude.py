@@ -1,48 +1,46 @@
 import anthropic
+from anthropic.types import Message, ToolParam
+from typing import Dict, List
+
 from .base import LLMClient
-from typing import Any, Dict, List, Optional
+from src.constants import DEFAULT_CLAUDE_MODEL, DEFAULT_LLM_MAX_TOKENS
 
 
 class ClaudeClient(LLMClient):
-    """
-    Claude client implementation.
-    """
+    """Claude client implementation using the Anthropic SDK."""
 
-    def setup_client(self):
+    def setup_client(self) -> None:
+        """Instantiate the Anthropic SDK client using the configured API key and endpoint."""
         self.client = anthropic.Anthropic(api_key=self.token, base_url=self.api_endpoint)
 
     def completion(
         self,
         messages: List[Dict[str, str]],
-        model: str = "claude-3-5-sonnet-20240620",
-        max_tokens: int = 1024,
-        **kwargs
-    ) -> Any:
-        """
-        Generate completion using Anthropic API.
-        """
+        model: str = DEFAULT_CLAUDE_MODEL,
+        max_tokens: int = DEFAULT_LLM_MAX_TOKENS,
+        **kwargs,
+    ) -> Message:
+        """Generate a completion using the Anthropic Messages API."""
         return self.client.messages.create(
             model=model,
             max_tokens=max_tokens,
             messages=messages,
-            **kwargs
+            **kwargs,
         )
 
     def function_call(
         self,
         messages: List[Dict[str, str]],
-        tools: List[Dict[str, Any]],
-        model: str = "claude-3-5-sonnet-20240620",
-        max_tokens: int = 1024,
-        **kwargs
-    ) -> Any:
-        """
-        Perform function calling using Anthropic API.
-        """
+        tools: List[ToolParam],
+        model: str = DEFAULT_CLAUDE_MODEL,
+        max_tokens: int = DEFAULT_LLM_MAX_TOKENS,
+        **kwargs,
+    ) -> Message:
+        """Perform tool/function calling using the Anthropic Messages API."""
         return self.client.messages.create(
             model=model,
             max_tokens=max_tokens,
             messages=messages,
             tools=tools,
-            **kwargs
+            **kwargs,
         )

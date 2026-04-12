@@ -4,8 +4,10 @@ version: v1
 # LLM
 # llm_api_key is intentionally absent — supply via LLM_API_KEY env var
 # or .env file. Never commit secrets to version-controlled YAML.
+# Default model ID targets the local vLLM server. Override via the
+# LLM_MODEL env var or .env file for other providers (e.g. claude-sonnet-4-6).
 # -----------------------------------------------------------------------
-llm_model: claude-sonnet-4-6
+llm_model: /model
 llm_max_tokens: 1024
 
 # -----------------------------------------------------------------------
@@ -28,11 +30,12 @@ session_max_messages: 100
 session_inactivity_timeout_seconds: 300
 tool_timeout_seconds: 10
 max_context_chars: 8000
+max_tool_calls: 10
 
 # -----------------------------------------------------------------------
 # Logging  (overridden by config/v1/logging.yaml for log-specific detail)
 # -----------------------------------------------------------------------
-log_path: ./logs/app.jsonl
+log_dir: ./logs
 log_level: INFO
 
 # -----------------------------------------------------------------------

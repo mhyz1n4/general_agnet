@@ -8,8 +8,9 @@ from the local file system using JSON format.
 import os
 import json
 import logging
-from typing import Any, Optional
+from typing import List, Optional
 from ..base import BaseStorage
+from ..types import StorageRecord
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +47,13 @@ class FileStorage(BaseStorage):
         safe_key: str = "".join([c for c in key if c.isalnum() or c in ("-", "_")]).rstrip()
         return os.path.join(self.base_path, f"{safe_key}.json")
 
-    def save(self, key: str, data: Any) -> None:
+    def save(self, key: str, data: StorageRecord) -> None:
         """
-        Persist data as a JSON file.
+        Persist a StorageRecord as a JSON file.
 
         Args:
             key: Unique identifier for the data.
-            data: The object to be serialized and saved.
+            data: The StorageRecord to serialise and save.
 
         Returns:
             None
@@ -70,7 +71,7 @@ class FileStorage(BaseStorage):
             logger.error(f"Error saving data to {path}: {str(e)}")
             raise
 
-    def load(self, key: str) -> Optional[Any]:
+    def load(self, key: str) -> Optional[StorageRecord]:
         """
         Load data from its corresponding JSON file.
 
@@ -93,3 +94,39 @@ class FileStorage(BaseStorage):
         except Exception as e:
             logger.error(f"Error loading data from {path}: {str(e)}")
             raise
+
+    def list_keys(self) -> List[str]:
+        """
+        Return all stored keys by scanning .json files in the base directory.
+
+        Returns:
+            A list of keys derived from file names (without the .json extension).
+        """
+        try:
+            return [
+                f[:-5]  # strip ".json"
+                for f in os.listdir(self.base_path)
+                if f.endswith(".json") and os.path.isfile(os.path.join(self.base_path, f))
+            ]
+        except OSError:
+            return []
+
+    def delete(self, key: str) -> bool:
+        """
+        Delete the JSON file for the given key.
+
+        Args:
+            key: Unique identifier for the data.
+
+        Returns:
+            True if the file was deleted, False if it did not exist.
+        """
+        path = self._get_path(key)
+        try:
+            os.unlink(path)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            logger.error(f"Error deleting key {key}: {str(exc)}")
+            return False

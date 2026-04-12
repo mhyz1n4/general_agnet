@@ -3,14 +3,14 @@ Post-memory-fetch hook — truncates oversized context and saves a retrieval_eve
 to the session memory for session-scoped recall.
 """
 
-from typing import Any, List, Optional
+from typing import List, Optional
 
+from src.constants import CONTEXT_BLOCK_DELIMITER, DEFAULT_MAX_CONTEXT_CHARS, MEMORY_ID_HEX_LENGTH, QUERY_LOG_PREVIEW_LENGTH
 from src.logging_config import get_logger
+from src.memory.base import BaseStorage
 from .base import BaseHook, HookResult
 
 logger = get_logger(__name__)
-
-_BLOCK_DELIMITER = "--- Context (Key:"
 
 
 class PostMemFetchHook(BaseHook):
@@ -18,8 +18,8 @@ class PostMemFetchHook(BaseHook):
 
     def __init__(
         self,
-        max_context_chars: int = 8000,
-        session_storage: Optional[Any] = None,
+        max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+        session_storage: Optional[BaseStorage] = None,
     ) -> None:
         self.max_context_chars = max_context_chars
         self.session_storage = session_storage
@@ -29,8 +29,24 @@ class PostMemFetchHook(BaseHook):
         context: str,
         retrieved_keys: Optional[List[str]] = None,
         query: str = "",
-        **kwargs: Any,
+        **kwargs: object,
     ) -> HookResult:
+        """
+        Truncate context to the configured character limit and log a retrieval event.
+
+        The truncated context is returned in ``HookResult.message``.  A
+        ``retrieval_event`` record is written to ``session_storage`` (if configured)
+        so the current session can recall which keys were retrieved for this query.
+
+        Args:
+            context:        Formatted memory context string from the retriever.
+            retrieved_keys: List of memory keys that contributed to *context*.
+            query:          Original user query (used to annotate the retrieval event).
+            **kwargs:       Unused; present for ``BaseHook`` compatibility.
+
+        Returns:
+            ``HookResult(success=True, message=truncated_context)``.
+        """
         retrieved_keys = retrieved_keys or []
 
         logger.debug(
@@ -44,10 +60,10 @@ class PostMemFetchHook(BaseHook):
             import uuid
             from datetime import datetime, timezone
 
-            event_id = f"retrieval_{uuid.uuid4().hex[:8]}"
+            event_id = f"retrieval_{uuid.uuid4().hex[:MEMORY_ID_HEX_LENGTH]}"
             event = {
                 "id": event_id,
-                "content": f"Retrieved keys for query '{query[:80]}': {retrieved_keys}",
+                "content": f"Retrieved keys for query '{query[:QUERY_LOG_PREVIEW_LENGTH]}': {retrieved_keys}",
                 "metadata": {
                     "type": "retrieval_event",
                     "query": query[:200],
@@ -66,11 +82,26 @@ class PostMemFetchHook(BaseHook):
         return HookResult(success=True, message=truncated_context)
 
     def _truncate(self, context: str) -> str:
+        """
+        Trim *context* to at most ``max_context_chars`` characters.
+
+        Splits on ``CONTEXT_BLOCK_DELIMITER`` boundaries and greedily includes blocks
+        until the budget is exhausted.  If a single block already exceeds the
+        limit, it is returned as-is (no mid-block truncation).  Returns the
+        original string unchanged when it is within the limit.
+
+        Args:
+            context: Formatted context string, possibly multi-block.
+
+        Returns:
+            A string whose length is ``<= max_context_chars``, or the original
+            string if it is within the limit or consists of a single oversized block.
+        """
         if not context or len(context) <= self.max_context_chars:
             return context
 
         # Split on block boundaries and keep top blocks that fit
-        blocks = context.split(_BLOCK_DELIMITER)
+        blocks = context.split(CONTEXT_BLOCK_DELIMITER)
         header = ""
         body_blocks = []
 
@@ -85,7 +116,7 @@ class PostMemFetchHook(BaseHook):
         total = len(header)
 
         for block in body_blocks:
-            reconstructed = _BLOCK_DELIMITER + block
+            reconstructed = CONTEXT_BLOCK_DELIMITER + block
             if total + len(reconstructed) > self.max_context_chars:
                 break
             kept.append(reconstructed)

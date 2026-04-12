@@ -13,7 +13,10 @@ import tempfile
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+from .types import MemoryMetadata
+from src.constants import DEFAULT_DLQ_MAX_ATTEMPTS
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +26,24 @@ if TYPE_CHECKING:
 
 @dataclass
 class DLQEntry:
+    """
+    One persisted entry in the dead-letter queue.
+
+    Attributes:
+        message_id:      Unique identifier of the failed memory save.
+        content:         Raw text content that failed to be stored.
+        metadata:        Metadata dict that was passed to ``save_message()``.
+        error:           String representation of the last exception.
+        attempts:        Number of retry attempts made so far.
+        last_attempt_ts: ISO-8601 UTC timestamp of the most recent attempt.
+        dead:            ``True`` when ``attempts >= max_attempts``; entry
+                         will not be retried again and is left for manual
+                         inspection.
+    """
+
     message_id: str
     content: str
-    metadata: Dict[str, Any]
+    metadata: MemoryMetadata
     error: str
     attempts: int = 0
     last_attempt_ts: str = ""
@@ -35,7 +53,7 @@ class DLQEntry:
 class DeadLetterQueue:
     """Persistent JSONL-backed dead-letter queue with background retry."""
 
-    def __init__(self, dlq_path: str, max_attempts: int = 3) -> None:
+    def __init__(self, dlq_path: str, max_attempts: int = DEFAULT_DLQ_MAX_ATTEMPTS) -> None:
         self.dlq_path = dlq_path
         self.max_attempts = max_attempts
         self._lock = threading.Lock()
@@ -49,7 +67,7 @@ class DeadLetterQueue:
         self,
         message_id: str,
         content: str,
-        metadata: Dict[str, Any],
+        metadata: MemoryMetadata,
         error: str,
     ) -> None:
         """Append a failed save to the DLQ."""
@@ -72,18 +90,33 @@ class DeadLetterQueue:
 
     def retry_all(self, memory_manager: "MemoryManager") -> int:
         """
-        Retry all non-dead entries.
-        Returns the number of successfully retried entries.
+        Retry all non-dead entries. Returns the number of successfully retried entries.
+
+        Uses a load-outside / merge-inside pattern to avoid two failure modes:
+
+        1. Deadlock: ``save_message`` may itself call ``enqueue``, which tries to
+           acquire ``self._lock``.  Holding the lock across ``save_message`` would
+           deadlock.
+
+        2. Lost entries: releasing the lock between load and save-back (the old
+           pattern) could silently discard any ``enqueue`` calls that occurred
+           during processing.
+
+        Solution: snapshot entries outside the lock, process them (calling
+        ``save_message`` without holding the lock), then re-acquire the lock and
+        merge the results back against the freshly re-read file so any concurrent
+        ``enqueue`` calls are preserved.
         """
         with self._lock:
-            entries = self._load_entries()
+            snapshot: List[DLQEntry] = self._load_entries()
 
-        retried = 0
-        updated: List[DLQEntry] = []
+        to_remove: set[str] = set()
+        updated_map: Dict[str, DLQEntry] = {}
+        retried: int = 0
 
-        for entry in entries:
+        for entry in snapshot:
             if entry.dead:
-                updated.append(entry)
+                updated_map[entry.message_id] = entry
                 continue
 
             entry.attempts += 1
@@ -95,8 +128,8 @@ class DeadLetterQueue:
                     "DLQ: retry succeeded",
                     extra={"data": {"message_id": entry.message_id}},
                 )
+                to_remove.add(entry.message_id)
                 retried += 1
-                # Don't append — entry removed from DLQ on success
             except Exception as exc:
                 entry.error = str(exc)
                 if entry.attempts >= self.max_attempts:
@@ -122,10 +155,21 @@ class DeadLetterQueue:
                             }
                         },
                     )
-                updated.append(entry)
+                updated_map[entry.message_id] = entry
 
         with self._lock:
-            self._save_entries(updated)
+            # Re-read the file to capture any entries added by enqueue() calls
+            # that occurred while we were processing (outside the lock above).
+            current: List[DLQEntry] = self._load_entries()
+            final: List[DLQEntry] = []
+            for e in current:
+                if e.message_id in to_remove:
+                    continue  # successfully retried — drop from DLQ
+                if e.message_id in updated_map:
+                    final.append(updated_map[e.message_id])  # use updated state
+                else:
+                    final.append(e)  # new entry added concurrently — preserve
+            self._save_entries(final)
 
         return retried
 
@@ -156,6 +200,15 @@ class DeadLetterQueue:
     # ------------------------------------------------------------------
 
     def _load_entries(self) -> List[DLQEntry]:
+        """
+        Read all entries from the JSONL DLQ file.
+
+        Must be called while ``self._lock`` is held.
+
+        Returns:
+            List of ``DLQEntry`` objects; empty list if the file does not
+            exist or contains no parseable lines.
+        """
         if not os.path.exists(self.dlq_path):
             return []
         entries: List[DLQEntry] = []
@@ -173,6 +226,19 @@ class DeadLetterQueue:
         return entries
 
     def _save_entries(self, entries: List[DLQEntry]) -> None:
+        """
+        Atomically overwrite the JSONL DLQ file with the given entries.
+
+        Uses a temp-file + ``os.replace`` to guarantee the file is never
+        left in a partially written state.  Must be called while
+        ``self._lock`` is held.
+
+        Args:
+            entries: Current list of ``DLQEntry`` objects to persist.
+
+        Raises:
+            OSError: If the temp file cannot be written or renamed.
+        """
         dir_ = os.path.dirname(self.dlq_path) or "."
         fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
         try:

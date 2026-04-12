@@ -26,11 +26,13 @@ import logging
 import threading
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from filelock import FileLock
 
 from ..base import BaseIndexer
+from ..types import IndexEntry, MemoryMetadata
+from src.constants import INDEX_LOCK_SUFFIX, INDEX_TMP_SUFFIX, JSON_INDENT, MIN_KEYWORD_LENGTH
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +54,11 @@ class JSONIndexer(BaseIndexer):
         """
         self.index_path: str = index_path
         self._thread_lock: threading.Lock = threading.Lock()
-        self._file_lock: FileLock = FileLock(f"{index_path}.lock")
+        self._file_lock: FileLock = FileLock(f"{index_path}{INDEX_LOCK_SUFFIX}")
         self._ensure_index_exists()
 
     def _ensure_index_exists(self) -> None:
+        """Create an empty JSON index file if it does not already exist."""
         if not os.path.exists(self.index_path):
             os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
             with open(self.index_path, "w", encoding="utf-8") as f:
@@ -65,7 +68,15 @@ class JSONIndexer(BaseIndexer):
     # Low-level helpers  (must be called while both locks are held)
     # ------------------------------------------------------------------
 
-    def _load_index(self) -> Dict[str, Any]:
+    def _load_index(self) -> Dict[str, IndexEntry]:
+        """
+        Read the JSON index from disk.
+
+        Must be called while both locks are held.
+
+        Returns:
+            The full index dict, or an empty dict on parse/IO error.
+        """
         try:
             with open(self.index_path, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -73,11 +84,22 @@ class JSONIndexer(BaseIndexer):
             logger.error(f"Error loading index at {self.index_path}, returning empty.")
             return {}
 
-    def _save_index(self, index_data: Dict[str, Any]) -> None:
-        tmp_path: str = f"{self.index_path}.tmp"
+    def _save_index(self, index_data: Dict[str, IndexEntry]) -> None:
+        """
+        Atomically write the index to disk via temp-file + ``os.replace``.
+
+        Must be called while both locks are held.
+
+        Args:
+            index_data: Complete index dict to persist.
+
+        Raises:
+            Exception: If the file cannot be written or renamed.
+        """
+        tmp_path: str = f"{self.index_path}{INDEX_TMP_SUFFIX}"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(index_data, f, indent=2, ensure_ascii=False)
+                json.dump(index_data, f, indent=JSON_INDENT, ensure_ascii=False)
             os.replace(tmp_path, self.index_path)
         except Exception as exc:
             logger.error(f"Error saving index to {self.index_path}: {exc}")
@@ -86,7 +108,16 @@ class JSONIndexer(BaseIndexer):
             raise
 
     def _locked(self):
-        """Context manager: acquire thread lock then file lock."""
+        """
+        Return a context manager that acquires both locks in the correct order.
+
+        Acquires ``_thread_lock`` first (intra-process) then ``_file_lock``
+        (inter-process) to guarantee a safe read-modify-write cycle.  Both
+        locks are released in reverse order on exit.
+
+        Returns:
+            A context manager instance; intended for use in ``with`` blocks.
+        """
         class _Ctx:
             def __init__(self_, outer):
                 self_._outer = outer
@@ -106,8 +137,18 @@ class JSONIndexer(BaseIndexer):
     # BaseIndexer interface
     # ------------------------------------------------------------------
 
-    def add(self, key: str, content: str, metadata: Dict[str, Any]) -> None:
-        """Index new content by extracting keywords and updating the index file."""
+    def add(self, key: str, content: str, metadata: MemoryMetadata) -> None:
+        """
+        Index new content by extracting keywords and updating the index file.
+
+        If *key* already exists it is overwritten.  The full
+        read-modify-write cycle is performed under both locks.
+
+        Args:
+            key:      Unique identifier for the content.
+            content:  Raw text from which keywords are extracted.
+            metadata: Metadata dict stored alongside the keywords.
+        """
         with self._locked():
             index = self._load_index()
             index[key] = {
@@ -116,8 +157,18 @@ class JSONIndexer(BaseIndexer):
             }
             self._save_index(index)
 
-    def update(self, key: str, content: str, metadata: Dict[str, Any]) -> None:
-        """Update an existing index entry (alias for add)."""
+    def update(self, key: str, content: str, metadata: MemoryMetadata) -> None:
+        """
+        Update an existing index entry with new content and metadata.
+
+        Functionally identical to ``add()``; provided for semantic clarity
+        when callers know the key already exists.
+
+        Args:
+            key:      Unique identifier for the entry to update.
+            content:  New text content (keywords are re-extracted).
+            metadata: Replacement metadata dict.
+        """
         self.add(key, content, metadata)
 
     def find_by_content_hash(self, content_hash: str) -> Optional[str]:
@@ -158,4 +209,4 @@ class JSONIndexer(BaseIndexer):
     def _extract_keywords(self, content: str) -> List[str]:
         """Extract unique words longer than 3 characters from content."""
         words: List[str] = re.findall(r"\w+", content.lower())
-        return list(set(w for w in words if len(w) > 3))
+        return list(set(w for w in words if len(w) > MIN_KEYWORD_LENGTH))

@@ -9,7 +9,6 @@ Usage:
 """
 
 import os
-from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
@@ -23,7 +22,7 @@ _env = Environment(
 )
 
 
-def render_prompt(name: str, **ctx: Any) -> str:
+def render_prompt(name: str, **ctx: object) -> str:
     """
     Render a Jinja2 template from src/prompts/{name}.j2.
 
