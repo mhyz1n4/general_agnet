@@ -76,6 +76,7 @@ CLAUDE.md
 AI_changes.md
 plan.md
 .gemini/
+design.md
 
 # Dot-files and dot-folders (editor state, tool configs, etc.)
 .*
