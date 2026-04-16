@@ -11,6 +11,16 @@ Sub-packages:
 
 from .base import BaseStorage, BaseIndexer, BaseRetriever, SearchResult
 from .manager import MemoryManager
+from .provider import (
+    MemoryItem,
+    MemoryProvider,
+    MemoryType,
+    Message,
+    ReasoningContext,
+    SearchFilters,
+    Summary,
+)
+from .stub_provider import StubMemoryProvider
 
 __all__ = [
     "BaseStorage",
@@ -18,6 +28,14 @@ __all__ = [
     "BaseRetriever",
     "SearchResult",
     "MemoryManager",
+    "MemoryProvider",
+    "MemoryItem",
+    "MemoryType",
+    "Message",
+    "ReasoningContext",
+    "SearchFilters",
+    "Summary",
+    "StubMemoryProvider",
 ]
 
 # RedisStorage is an optional dependency — only exported when redis is installed.

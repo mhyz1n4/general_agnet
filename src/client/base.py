@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Type, TypeVar
+from typing import Dict, Optional, Type, TypeVar
 
 
 T = TypeVar("T", bound="LLMClient")
@@ -14,6 +14,12 @@ class LLMClient(ABC):
     _instances: Dict[Type["LLMClient"], "LLMClient"] = {}
 
     def __new__(cls, *args, **kwargs):
+        """
+        Return the existing singleton instance for *cls*, creating it if needed.
+
+        The instance is stored in ``_instances`` keyed by concrete class so
+        that each subclass maintains its own independent singleton.
+        """
         if cls not in cls._instances:
             instance = super().__new__(cls)
             cls._instances[cls] = instance
@@ -39,15 +45,17 @@ class LLMClient(ABC):
         pass
 
     @abstractmethod
-    def completion(self, *args, **kwargs) -> Any:
+    def completion(self, *args, **kwargs) -> object:
         """
         Generate a completion for a given prompt.
+        Concrete subclasses narrow the return type to the provider-specific
+        response object (e.g. anthropic.types.Message, openai ChatCompletion).
         """
-        pass
 
     @abstractmethod
-    def function_call(self, *args, **kwargs) -> Any:
+    def function_call(self, *args, **kwargs) -> object:
         """
         Execute a function call with the LLM.
+        Concrete subclasses narrow the return type to the provider-specific
+        response object.
         """
-        pass

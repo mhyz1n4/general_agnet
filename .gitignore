@@ -70,3 +70,15 @@ MANIFEST
 
 # Claude Code internal
 .claude/
+
+# AI / local dev only — not for version control
+CLAUDE.md
+AI_changes.md
+plan.md
+.gemini/
+design.md
+
+# Dot-files and dot-folders (editor state, tool configs, etc.)
+.*
+!.gitignore
+!.env.example

@@ -1,8 +1,10 @@
 import json
 import logging
 import redis
-from typing import Any, Optional
+from typing import Optional
 from ..base import BaseStorage
+from ..types import StorageRecord
+from src.constants import REDIS_DEFAULT_HOST, REDIS_DEFAULT_PORT, REDIS_DEFAULT_PREFIX, REDIS_DEFAULT_TTL
 
 logger = logging.getLogger(__name__)
 
@@ -15,46 +17,61 @@ class RedisStorage(BaseStorage):
 
     def __init__(
         self,
-        host: str = "localhost",
-        port: int = 6379,
+        host: str = REDIS_DEFAULT_HOST,
+        port: int = REDIS_DEFAULT_PORT,
         db: int = 0,
         password: Optional[str] = None,
-        prefix: str = "mem:",
-        default_ttl: Optional[int] = 3600  # Default 1 hour TTL for short-term memory
+        prefix: str = REDIS_DEFAULT_PREFIX,
+        default_ttl: Optional[int] = REDIS_DEFAULT_TTL,
+        client: Optional[redis.Redis] = None,
     ):
         """
         Initialize the Redis storage client.
 
         Args:
-            host: Redis server host.
-            port: Redis server port.
-            db: Redis database number.
-            password: Redis server password.
+            host: Redis server host. Ignored when *client* is provided.
+            port: Redis server port. Ignored when *client* is provided.
+            db: Redis database number. Ignored when *client* is provided.
+            password: Redis server password. Ignored when *client* is provided.
             prefix: Prefix to use for all keys stored via this instance.
             default_ttl: Default Time-To-Live in seconds for new keys.
+            client: Optional pre-built ``redis.Redis`` instance. When supplied,
+                connection parameters above are ignored and no ``ping`` is
+                issued — the caller is responsible for verifying connectivity.
         """
         self.prefix = prefix
         self.default_ttl = default_ttl
-        try:
-            self.client = redis.Redis(
-                host=host,
-                port=port,
-                db=db,
-                password=password,
-                decode_responses=True  # Ensure we get strings back from Redis
-            )
-            # Test connectivity
-            self.client.ping()
-            logger.info(f"Connected to Redis at {host}:{port}")
-        except redis.ConnectionError as e:
-            logger.error(f"Failed to connect to Redis: {str(e)}")
-            raise
+        if client is not None:
+            self.client = client
+        else:
+            try:
+                self.client = redis.Redis(
+                    host=host,
+                    port=port,
+                    db=db,
+                    password=password,
+                    decode_responses=True  # Ensure we get strings back from Redis
+                )
+                # Test connectivity
+                self.client.ping()
+                logger.info(f"Connected to Redis at {host}:{port}")
+            except redis.ConnectionError as e:
+                logger.error(f"Failed to connect to Redis: {str(e)}")
+                raise
 
     def _get_full_key(self, key: str) -> str:
-        """Helper to append prefix to a key."""
+        """
+        Prepend the instance prefix to *key* to produce the full Redis key.
+
+        Args:
+            key: Logical storage key (without prefix).
+
+        Returns:
+            The full Redis key string used for all Redis operations.
+        """
         return f"{self.prefix}{key}"
 
-    def save(self, key: str, data: Any, ttl: Optional[int] = None) -> None:
+    def save(self, key: str, data: StorageRecord, ttl: Optional[int] = None) -> None:
         """
         Save data to Redis as a JSON string.
 
@@ -81,7 +98,7 @@ class RedisStorage(BaseStorage):
             logger.error(f"Error saving to Redis: {str(e)}")
             raise
 
-    def load(self, key: str) -> Optional[Any]:
+    def load(self, key: str) -> Optional[StorageRecord]:
         """
         Load data from Redis and deserialize from JSON.
 
@@ -103,6 +120,23 @@ class RedisStorage(BaseStorage):
         except redis.RedisError as e:
             logger.error(f"Error loading from Redis: {str(e)}")
             return None
+
+    def list_keys(self) -> list[str]:
+        """
+        Return all logical keys stored under this instance's prefix.
+
+        Scans Redis for all keys matching ``{prefix}*`` and strips the
+        prefix before returning.  Returns an empty list on any Redis error.
+
+        Returns:
+            A list of logical key strings (prefix removed).
+        """
+        try:
+            full_keys: list[str] = list(self.client.keys(f"{self.prefix}*"))
+            return [k[len(self.prefix):] for k in full_keys]
+        except Exception as exc:
+            logger.error(f"Error listing Redis keys: {str(exc)}")
+            return []
 
     def delete(self, key: str) -> bool:
         """
