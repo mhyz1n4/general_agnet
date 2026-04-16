@@ -169,6 +169,7 @@ def test_orchestrator_turn_overhead_p50_under_200ms(seeded_memory, tmp_path):
     cfg.session_inactivity_timeout_seconds = 300
     cfg.tool_timeout_seconds = 30
     cfg.max_context_chars = 8000
+    cfg.max_tool_calls = 10
     cfg.llm_max_tokens = 1024
     cfg.index_path = str(tmp_path / "index.json")
     cfg.memory_root = str(tmp_path / "memory")
@@ -207,6 +208,7 @@ def test_orchestrator_turn_overhead_p95_under_200ms(seeded_memory, tmp_path):
     cfg.session_inactivity_timeout_seconds = 300
     cfg.tool_timeout_seconds = 30
     cfg.max_context_chars = 8000
+    cfg.max_tool_calls = 10
     cfg.llm_max_tokens = 1024
     cfg.index_path = str(tmp_path / "index.json")
     cfg.memory_root = str(tmp_path / "memory")
