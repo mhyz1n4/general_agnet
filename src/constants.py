@@ -132,3 +132,11 @@ VLLM_BASE_URL: str = "http://localhost:8000/v1"
 VLLM_MODEL_ID: str = "/model"
 # vLLM accepts any non-empty string as the API key when auth is disabled.
 VLLM_API_KEY: str = "EMPTY"
+
+# ---------------------------------------------------------------------------
+# External tools (V1.1 M2)
+# ---------------------------------------------------------------------------
+
+DEFAULT_TAVILY_ENDPOINT: str = "https://api.tavily.com/search"
+DEFAULT_TAVILY_TIMEOUT_SECONDS: int = 10
+DEFAULT_TAVILY_MAX_RESULTS: int = 5

@@ -119,3 +119,48 @@ def llm_endpoint_or_none():
         pass
     return None
 
+
+# ---------------------------------------------------------------------------
+# Strands SDK patch — shared by integration and eval harnesses
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def strands_patch():
+    """
+    Patch Strands SDK to count tool calls and handle vLLM streaming quirks
+    (strands issue #815). Restores the original function after each test.
+
+    Lives in the top-level conftest so both integration and eval suites
+    can depend on it without duplicating the patch logic.
+    """
+    try:
+        import strands.tools.tools as _strands_tools
+        import strands.event_loop.streaming as _strands_streaming
+        from strands.tools.tools import InvalidToolUseNameException
+        from src.orchestrator import tool_call_counter
+
+        _orig = _strands_tools.validate_tool_use_name
+
+        def _safe(tool: dict) -> None:
+            """Guarded replacement for ``validate_tool_use_name``."""
+            count = getattr(tool_call_counter, "count", 0) + 1
+            limit = getattr(tool_call_counter, "limit", 0)
+            tool_call_counter.count = count
+            if limit and count > limit:
+                raise InvalidToolUseNameException(
+                    f"tool call limit reached ({count}/{limit})"
+                )
+            if not tool.get("name"):
+                raise InvalidToolUseNameException(
+                    "tool name is None or empty (strands #815)"
+                )
+            _orig(tool)
+
+        _strands_tools.validate_tool_use_name = _safe
+        _strands_streaming.validate_tool_use_name = _safe
+        yield
+        _strands_tools.validate_tool_use_name = _orig
+        _strands_streaming.validate_tool_use_name = _orig
+    except ImportError:
+        yield
+

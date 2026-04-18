@@ -21,6 +21,8 @@ from src.hooks.pre_session import PreSessionHook
 from src.hooks.post_session import PostSessionHook
 from src.prompts.loader import render_prompt
 from src.tools.memorize import create_memorize_tool
+from src.tools.search_memory import create_search_memory_tool
+from src.tools.web_search import create_web_search_tool_from_config
 from src.constants import (
     DEFAULT_METRICS_FILENAME,
     SESSION_ID_HEX_LENGTH,
@@ -125,7 +127,13 @@ def main() -> None:
     _strands_streaming.validate_tool_use_name = _safe_validate_tool_use_name
 
     memorize_tool = create_memorize_tool(memory_provider, session_id=session_id)
+    search_memory_tool = create_search_memory_tool(memory_provider)
+    web_search_tool = create_web_search_tool_from_config(config)
     system_prompt = render_prompt("system_prompt")
+
+    agent_tools = [memorize_tool, search_memory_tool]
+    if web_search_tool is not None:
+        agent_tools.append(web_search_tool)
 
     model = OpenAIModel(
         client_args={
@@ -142,7 +150,7 @@ def main() -> None:
     )
     agent = Agent(
         model=model,
-        tools=[memorize_tool],
+        tools=agent_tools,
         system_prompt=system_prompt,
         conversation_manager=compaction_manager,
         callback_handler=None,

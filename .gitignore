@@ -74,11 +74,9 @@ MANIFEST
 # AI / local dev only — not for version control
 CLAUDE.md
 AI_changes.md
-plan.md
-plan_v1_1_features.md
+# Design and Planning (local only)
+.design/
 .gemini/
-design.md
-design_v1_1.md
 
 # Dot-files and dot-folders (editor state, tool configs, etc.)
 .*

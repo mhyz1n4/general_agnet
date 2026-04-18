@@ -15,7 +15,7 @@ adding new sections to the file never breaks running code.
 """
 
 import os
-from typing import Dict, Tuple, Type, Union
+from typing import Dict, Optional, Tuple, Type, Union
 
 import yaml
 from pydantic.fields import FieldInfo
@@ -31,6 +31,8 @@ from src.constants import (
     DEFAULT_STRANDS_LOG_LEVEL,
     DEFAULT_MAX_CONTEXT_CHARS,
     DEFAULT_SESSION_INACTIVITY_TIMEOUT,
+    DEFAULT_TAVILY_ENDPOINT,
+    DEFAULT_TAVILY_TIMEOUT_SECONDS,
     DEFAULT_TOOL_TIMEOUT_SECONDS,
     VLLM_API_KEY,
     VLLM_BASE_URL,
@@ -148,6 +150,16 @@ class Config(BaseSettings):
     log_dir: str = DEFAULT_LOG_DIR
     log_level: str = DEFAULT_LOG_LEVEL
     strands_log_level: str = DEFAULT_STRANDS_LOG_LEVEL
+
+    # External tools — Tavily web search (V1.1 M2). Tool unregisters when
+    # token is unset so the agent never sees a broken web_search.
+    tavily_search_token: Optional[str] = None
+    tavily_search_endpoint: str = DEFAULT_TAVILY_ENDPOINT
+    tavily_search_timeout_seconds: int = DEFAULT_TAVILY_TIMEOUT_SECONDS
+
+    # Risky-action confirmation (V1.1 M4). ``auto`` picks interactive when
+    # stdin is a TTY, otherwise non_interactive (which denies by default).
+    tool_confirmation_mode: str = "auto"
 
     model_config = SettingsConfigDict(
         env_file=".env",

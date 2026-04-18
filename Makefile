@@ -1,4 +1,4 @@
-.PHONY: setup run dev dev-redis-start dev-redis-stop test test-unit test-integration test-llm test-benchmark test-all test-infra-start test-infra-stop clean help
+.PHONY: setup run dev dev-redis-start dev-redis-stop test test-unit test-integration test-llm test-benchmark test-eval test-all test-infra-start test-infra-stop clean help
 
 DEV_REDIS_CONTAINER  := agent-redis-dev
 TEST_REDIS_CONTAINER := agent-redis-test
@@ -18,6 +18,7 @@ help:
 	@echo "  test-integration   - Run integration tests (requires test-infra-start first)"
 	@echo "  test-llm           - Run LLM integration tests (requires running vLLM endpoint)"
 	@echo "  test-benchmark     - Run latency benchmarks (P50/P95 targets)"
+	@echo "  test-eval          - Run golden-fixture eval harness (requires live LLM)"
 	@echo "  test-all           - Run unit + integration + LLM tests"
 	@echo "  test-infra-start   - Start test Redis on port 6380 (Docker)"
 	@echo "  test-infra-stop    - Stop test Redis and clean test dirs"
@@ -70,6 +71,10 @@ test-llm:
 # Run latency benchmarks
 test-benchmark:
 	. .venv/bin/activate && PYTHONPATH=. pytest tests/benchmarks/ -v -m benchmark -s
+
+# Run the golden-fixture eval harness (requires live LLM endpoint)
+test-eval:
+	. .venv/bin/activate && PYTHONPATH=. pytest tests/eval/ -v -m eval -s
 
 # Run all tests
 test-all: test-unit test-integration test-llm

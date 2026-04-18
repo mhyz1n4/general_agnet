@@ -14,6 +14,9 @@ filelock>=3.0.0
 # Config & settings
 pydantic-settings>=2.0.0
 
+# YAML parsing (eval harness fixtures)
+PyYAML>=6.0
+
 # Templating
 jinja2>=3.1.0
 

@@ -69,14 +69,26 @@ def _safe_split_index(messages: list[dict], raw_split: int) -> int:
 def _strands_to_provider_messages(messages: list[dict]) -> list[Message]:
     """Convert Strands message dicts to ``MemoryProvider.Message`` dicts.
 
-    Extracts role and flattens text content blocks into a single string.
+    Extracts role and flattens text, toolUse, and toolResult content blocks
+    into a single string.
     """
     result: list[Message] = []
     for msg in messages:
         texts: list[str] = []
         for block in msg.get("content", []):
-            if isinstance(block, dict) and "text" in block:
+            if not isinstance(block, dict):
+                continue
+            if "text" in block:
                 texts.append(block["text"])
+            elif "toolUse" in block:
+                use = block["toolUse"]
+                texts.append(f"[Tool Use: {use.get('name')}({use.get('input')})]")
+            elif "toolResult" in block:
+                res = block["toolResult"]
+                # toolResult.content is a list of blocks; we extract text only
+                res_texts = [b.get("text", "") for b in res.get("content", []) if isinstance(b, dict)]
+                texts.append(f"[Tool Result: {' '.join(res_texts)}]")
+
         result.append({
             "role": msg.get("role", "user"),
             "content": "\n".join(texts),
@@ -205,6 +217,8 @@ class ReMeCompactionManager(ConversationManager):
 
         if summary and summary.text:
             try:
+                # TODO: V1.2 — Extract long-term semantic/procedural memories from
+                # the compacted dialog before saving the summary as episodic.
                 self._provider.save(
                     summary.text,
                     type="episodic",

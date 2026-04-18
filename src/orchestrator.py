@@ -310,7 +310,10 @@ class Orchestrator:
         def _invoke() -> object:
             tool_call_counter.count = 0
             tool_call_counter.limit = max_calls
-            return ctx.run(self.agent, full_input)
+            try:
+                return ctx.run(self.agent, full_input)
+            finally:
+                self.metrics.tool_calls_made += getattr(tool_call_counter, "count", 0)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_invoke)
