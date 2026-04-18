@@ -3,8 +3,7 @@ Integration tests for ReMeLightProvider.
 
 These tests boot a real ReMeLight instance (SQLite FTS, no vectors, stub LLM)
 on a ``tmp_path`` working directory. They verify end-to-end behavior through
-the ``MemoryProvider`` interface: save/search round-trip, session persistence,
-compact, check_context.
+the ``MemoryProvider`` interface: save/search round-trip, compact, check_context.
 
 The ReMeLight file watcher indexes saved .md files asynchronously. Tests use
 a short poll loop to wait for indexing before asserting on search results.
@@ -26,20 +25,41 @@ WATCHER_INDEX_TIMEOUT_SECONDS = 10.0
 WATCHER_POLL_INTERVAL_SECONDS = 0.5
 
 
-@pytest.fixture
-def provider(tmp_path: Path) -> Iterator[ReMeLightProvider]:
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_after_suite() -> Iterator[None]:
     """
-    Spin up a real ``ReMeLightProvider`` rooted at ``tmp_path/reme`` and
+    Ensure that the ``test_reme_storage`` directory is removed after the
+    entire test suite has finished running.
+    """
+    yield
+    import shutil
+    import os
+    if os.path.exists("test_reme_storage"):
+        shutil.rmtree("test_reme_storage")
+
+
+@pytest.fixture
+def provider() -> Iterator[ReMeLightProvider]:
+    """
+    Spin up a real ``ReMeLightProvider`` rooted at ``test_reme_storage`` and
     tear it down at test end.
 
     Yields:
         A started ``ReMeLightProvider`` bound to session ``"test-session"``.
     """
-    p = ReMeLightProvider(memory_root=str(tmp_path / "reme"), session_id="test-session")
+    import os
+    import shutil
+
+    storage_path = "test_reme_storage"
+    p = ReMeLightProvider(memory_root=storage_path, session_id="test-session")
     try:
         yield p
     finally:
         p.close()
+        # Cleanup the test storage folder after each test run to ensure isolation
+        # and leave the workspace clean.
+        if os.path.exists(storage_path):
+            shutil.rmtree(storage_path)
 
 
 def _search_until_found(
@@ -81,10 +101,12 @@ class TestProtocolConformance:
 class TestSaveAndSearch:
     """Saved memories are discoverable by FTS after the watcher indexes them."""
 
-    def test_save_writes_file(self, provider: ReMeLightProvider, tmp_path: Path) -> None:
+    def test_save_writes_file(self, provider: ReMeLightProvider) -> None:
         """``save`` materialises a frontmattered ``.md`` file under ``memory/`` with the expected fields."""
         provider.save("user prefers Python", type="semantic", topic="prefs")
-        memory_dir = tmp_path / "reme" / "memory"
+        import os
+        from pathlib import Path
+        memory_dir = Path("test_reme_storage") / "memory"
         assert memory_dir.exists()
         files = list(memory_dir.glob("*.md"))
         assert len(files) == 1
@@ -116,35 +138,6 @@ class TestSaveAndSearch:
             provider, "a", SearchFilters(limit=5, types=("semantic",))
         )
         assert all(r.type == "semantic" for r in results)
-
-
-class TestSessionHistory:
-    """Session turns persist to dialog/ and round-trip by session_id."""
-
-    def test_single_session_roundtrip(self, provider: ReMeLightProvider) -> None:
-        """Turns saved under one session return in insertion order from ``get_session_history``."""
-        provider.save_session_turn(
-            {"role": "user", "content": "hello", "session_id": "s-alpha"}
-        )
-        provider.save_session_turn(
-            {"role": "assistant", "content": "hi", "session_id": "s-alpha"}
-        )
-        history = provider.get_session_history("s-alpha")
-        assert len(history) == 2
-        assert history[0]["content"] == "hello"
-        assert history[1]["content"] == "hi"
-
-    def test_sessions_isolated(self, provider: ReMeLightProvider) -> None:
-        """Turns saved under different sessions are returned independently; unknown sessions yield ``[]``."""
-        provider.save_session_turn(
-            {"role": "user", "content": "in a", "session_id": "s-a"}
-        )
-        provider.save_session_turn(
-            {"role": "user", "content": "in b", "session_id": "s-b"}
-        )
-        assert len(provider.get_session_history("s-a")) == 1
-        assert len(provider.get_session_history("s-b")) == 1
-        assert provider.get_session_history("s-missing") == []
 
 
 class TestCompact:
@@ -189,19 +182,3 @@ class TestCheckContext:
         assert len(kept) == 2
 
 
-class TestPreReasoningHook:
-    """Hook returns context unchanged when under budget."""
-
-    def test_passthrough_with_generous_budget(
-        self, provider: ReMeLightProvider
-    ) -> None:
-        """With a generous budget the hook leaves ``context.messages`` untouched."""
-        from src.memory.provider import ReasoningContext
-
-        ctx = ReasoningContext(
-            messages=[{"role": "user", "content": "hi"}],
-            memory_items=[],
-            budget_tokens=100_000,
-        )
-        out = provider.pre_reasoning_hook(ctx)
-        assert len(out.messages) == 1

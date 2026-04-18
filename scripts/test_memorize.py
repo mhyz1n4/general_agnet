@@ -59,35 +59,18 @@ print(f"  Log dir  : {session_log_dir}")
 print(f"{'='*60}\n")
 
 # ---------------------------------------------------------------------------
-# Memory stack (file-system only — no Redis needed)
+# Memory provider (V1.1 — StubMemoryProvider for smoke test)
 # ---------------------------------------------------------------------------
-from src.memory.file_system.indexer import JSONIndexer
-from src.memory.file_system.retriever import KeywordRetriever
-from src.memory.file_system.typed_storage import TypedMarkdownStorage
-from src.memory.manager import MemoryManager
-from src.memory.dlq import DeadLetterQueue
-from src.query.classifier import RegexClassifier
-from src.query.preprocessor import TemporalExtractor
+from src.memory.stub_provider import StubMemoryProvider
+from src.memory.provider import SearchFilters
 from src.tools.memorize import create_memorize_tool
 from src.prompts.loader import render_prompt
 
-storage = TypedMarkdownStorage(memory_root=config.memory_root)
-indexer = JSONIndexer(index_path=config.index_path)
-retriever = KeywordRetriever(index_path=config.index_path, storage=storage)
-dlq = DeadLetterQueue(dlq_path=config.dlq_path, max_attempts=config.dlq_max_attempts)
-memory_manager = MemoryManager(
-    storage=storage,
-    indexer=indexer,
-    retriever=retriever,
-    classifier=RegexClassifier(),
-    temporal_extractor=TemporalExtractor(),
-    dlq=dlq,
-    session_max_messages=config.session_max_messages,
-)
-memorize_fn = create_memorize_tool(memory_manager, session_id=session_id)
+provider = StubMemoryProvider()
+memorize_fn = create_memorize_tool(provider, session_id=session_id)
 
 # ---------------------------------------------------------------------------
-# Tool registry — maps tool name → callable (no Strands dispatcher needed)
+# Tool registry — maps tool name -> callable (no Strands dispatcher needed)
 # ---------------------------------------------------------------------------
 TOOLS = {
     "memorize": memorize_fn,
@@ -131,6 +114,7 @@ _TOOL_CALL_RE = re.compile(
 
 
 def _strip_thinking(text: str) -> str:
+    """Remove CoT thinking blocks from text."""
     return _THINKING_RE.sub("", text).strip()
 
 
@@ -222,7 +206,6 @@ for turn in range(MAX_TURNS):
             })
 
     if all_calls:
-        # Execute each tool call and feed results back
         messages.append({"role": "assistant", "content": content})
         for tc in all_calls:
             name = tc["name"]
@@ -239,7 +222,6 @@ for turn in range(MAX_TURNS):
                 })
             else:
                 print(f"  [WARN] Unknown tool: {name}")
-        # Continue loop — model may need to see tool results
         continue
 
     # No tool calls — model is done
@@ -261,16 +243,13 @@ if tool_calls_executed:
     for tc in tool_calls_executed:
         print(f"    {tc['tool']}({tc['args']}) → {tc['result']}")
 
-try:
-    context, keys = memory_manager.get_context_with_keys("orange today", limit=5)
-    fresh_keys = [k for k in keys if k not in ("turn_cea554afca3e_0",)]  # filter old test data
-    if fresh_keys:
-        print(f"\n  PASS — entries found in memory index: {fresh_keys}")
-        print(f"  Context: {context[:300]}")
-    else:
-        print("\n  FAIL — no new entries found in memory index.")
-        print(f"  (All keys returned: {keys})")
-except Exception as exc:
-    print(f"  ERROR checking memory: {exc}")
+results = provider.search("orange", SearchFilters(limit=5))
+if results:
+    print(f"\n  PASS — {len(results)} entry(ies) found in memory")
+    for r in results:
+        print(f"    [{r.type}] {r.content[:200]}")
+else:
+    print("\n  FAIL — no entries found in memory matching 'orange'.")
+    print(f"  (All items: {list(provider._items.values())})")
 
 print()

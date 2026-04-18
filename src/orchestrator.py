@@ -1,20 +1,19 @@
 """
 Chat session orchestrator.
 
-Per-turn flow:
-  pre_mem_fetch hook → get_context_with_keys → post_mem_fetch hook
-  → render context_prefix.j2 → agent(prefix + user_input)
-  → save turn to memory → update metrics
+Per-turn flow (V1.1):
+  inline normalize query -> memory_provider.search() -> render context
+  (trimming low-relevance items to fit max_context_chars)
+  -> agent(prefix + user_input) -> memory_provider.save() -> update metrics
 
 Design features:
   - Tool timeout: every agent call is wrapped with TOOL_TIMEOUT_SECONDS.
-  - Error recovery (§5c): tracks consecutive turn failures; after two in a row
+  - Error recovery (SS5c): tracks consecutive turn failures; after two in a row
     returns a graceful degraded message and resets the counter.
-  - Context budget (§5b): logs a critical alert when injected context approaches
+  - Context budget (SS5b): logs a critical alert when injected context approaches
     the configured character limit.  Strands manages its own history so we cannot
     truncate it directly, but the alert signals operator intervention.
-  - Enhanced metrics: duration, token estimate, latency, turn count, hit/miss,
-    eviction count, index/storage sizes.
+  - Enhanced metrics: duration, token estimate, latency, turn count, hit/miss.
 """
 
 import concurrent.futures
@@ -25,7 +24,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, List, Optional
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -39,13 +38,10 @@ from src.constants import (
     DEFAULT_RETRIEVAL_LIMIT,
     EXIT_COMMANDS,
     MEMORY_TIMESTAMP_DISPLAY_FORMAT,
-    MEMORY_TYPE_EPISODIC,
 )
-from src.hooks.post_mem_fetch import PostMemFetchHook
 from src.hooks.post_session import PostSessionHook
-from src.hooks.pre_mem_fetch import PreMemFetchHook
 from src.logging_config import get_logger, set_trace_id
-from src.memory.manager import MemoryManager
+from src.memory.provider import MemoryItem, MemoryProvider, SearchFilters
 from src.memory.types import SessionMetricsDict, TurnRecord
 from src.prompts.loader import render_prompt
 
@@ -57,21 +53,61 @@ _GRACEFUL_ERROR = (
 )
 
 # Thread-local state used by the Strands #815 workaround patch in main.py.
-# Each agent invocation (which runs in its own executor thread) initialises
-# these before calling the agent so the patch can enforce a per-invocation
-# tool-call retry limit without shared mutable global state.
 tool_call_counter = threading.local()  # attrs: count (int), limit (int)
 
-# Matches <think>…</think> and <thinking>…</thinking> emitted by CoT/reasoning
-# models (e.g. DeepSeek-R1, QwQ, o1-style open-weights).  The block is always
-# stripped before the response reaches the user or memory — we never want raw
-# chain-of-thought in either place.
 _THINKING_TAG_RE = re.compile(r"<think(?:ing)?>\s*.*?\s*</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+
+_QUERY_NORMALIZE_RE = re.compile(r"[^a-zA-Z0-9\s']")
+_WHITESPACE_COLLAPSE_RE = re.compile(r"\s+")
 
 
 def _strip_thinking(text: str) -> str:
     """Remove CoT thinking blocks from *text* and return the cleaned string."""
     return _THINKING_TAG_RE.sub("", text).strip()
+
+
+def _normalize_query(query: str) -> str:
+    """Normalize a user query for memory search: strip punctuation, lowercase, collapse whitespace."""
+    cleaned = _QUERY_NORMALIZE_RE.sub("", query)
+    cleaned = cleaned.lower()
+    return _WHITESPACE_COLLAPSE_RE.sub(" ", cleaned).strip()
+
+
+def _build_context_input(
+    results: List[MemoryItem],
+    user_input: str,
+    max_chars: int,
+) -> tuple[str, int]:
+    """Render context_prefix + user_input, dropping tail items that exceed budget.
+
+    Items are added in order (assumed most-relevant-first) and dropped from the
+    tail until the rendered ``prefix + user_input`` fits within ``max_chars``.
+
+    Args:
+        results:    Memory items ordered most-relevant-first.
+        user_input: Raw user query (always included verbatim).
+        max_chars:  Hard cap on the returned string length.
+
+    Returns:
+        ``(full_input, dropped_count)`` — the agent input and how many tail
+        items were excluded by the budget.
+    """
+    def _render(items: List[MemoryItem]) -> str:
+        context = "\n\n".join(f"[{r.type}] {r.content}" for r in items) if items else ""
+        prefix = render_prompt("context_prefix", memory_context=context)
+        return f"{prefix}{user_input}" if prefix.strip() else user_input
+
+    kept: List[MemoryItem] = []
+    full_input: Optional[str] = None
+    for item in results:
+        candidate = _render(kept + [item])
+        if len(candidate) > max_chars:
+            break
+        kept.append(item)
+        full_input = candidate
+    if full_input is None:
+        full_input = _render(kept)
+    return full_input, len(results) - len(kept)
 
 
 @dataclass
@@ -82,11 +118,10 @@ class SessionMetrics:
     turn_count: int = 0
     memory_hits: int = 0
     memory_misses: int = 0
-    llm_token_count_est: int = 0    # estimated: (input_chars + output_chars) // CHARS_PER_TOKEN
-    llm_latency_ms: float = 0.0     # wall-clock ms spent inside agent() calls
-    tool_calls_made: int = 0        # tracked externally where Strands exposes it
-    tool_failures: int = 0          # turns where agent() raised an exception
-    eviction_count: int = 0         # Redis→FS evictions (from MemoryManager)
+    llm_token_count_est: int = 0
+    llm_latency_ms: float = 0.0
+    tool_calls_made: int = 0
+    tool_failures: int = 0
     turns: List[TurnRecord] = field(default_factory=list)
 
     def to_dict(self) -> SessionMetricsDict:
@@ -95,8 +130,6 @@ class SessionMetrics:
 
         Returns:
             A ``SessionMetricsDict`` with all tracked fields populated.
-            ``duration_seconds`` is computed relative to ``start_time`` at
-            the moment of this call.
         """
         return {
             "duration_seconds": round(time.time() - self.start_time, 2),
@@ -107,7 +140,6 @@ class SessionMetrics:
             "llm_latency_ms": round(self.llm_latency_ms, 1),
             "tool_calls_made": self.tool_calls_made,
             "tool_failures": self.tool_failures,
-            "eviction_count": self.eviction_count,
             "turns": self.turns,
         }
 
@@ -118,9 +150,7 @@ class Orchestrator:
     def __init__(
         self,
         agent: Callable[[str], object],
-        memory_manager: MemoryManager,
-        pre_mem_fetch_hook: PreMemFetchHook,
-        post_mem_fetch_hook: PostMemFetchHook,
+        memory_provider: MemoryProvider,
         post_session_hook: PostSessionHook,
         config: Config,
         session_id: str,
@@ -130,33 +160,17 @@ class Orchestrator:
         Initialise the orchestrator for a single chat session.
 
         Args:
-            agent:               Strands Agent callable.  Accepts a single string
-                                 (the full prompt including injected context) and
-                                 returns the model response as a string or
-                                 string-coercible object.
-            memory_manager:      Manages long-term memory reads and writes.
-                                 ``get_context_with_keys`` is called on every turn;
-                                 ``save_message`` stores the completed turn.
-            pre_mem_fetch_hook:  Runs before ``get_context_with_keys`` to normalise
-                                 the query (e.g. lowercase, strip punctuation).
-            post_mem_fetch_hook: Runs after ``get_context_with_keys`` to truncate
-                                 context exceeding ``config.max_context_chars`` and
-                                 optionally log the retrieval event.
+            agent:               Strands Agent callable.
+            memory_provider:     ``MemoryProvider`` implementation for search,
+                                 save, context management, and session history.
             post_session_hook:   Fired once when the chat loop exits.  Writes
-                                 metrics, generates a session summary, and flushes
-                                 the Redis session store to long-term storage.
-            config:              Validated application settings (timeouts, limits,
-                                 model ID, etc.).
-            session_id:          Unique identifier for this chat session (UUID hex).
-                                 Used in log correlation, file paths, and Redis key
-                                 scoping.
+                                 session metrics.
+            config:              Validated application settings.
+            session_id:          Unique identifier for this chat session.
             console:             Rich Console instance for rendering output.
-                                 Defaults to a fresh ``Console()`` if not provided.
         """
         self.agent = agent
-        self.memory_manager = memory_manager
-        self.pre_mem_fetch_hook = pre_mem_fetch_hook
-        self.post_mem_fetch_hook = post_mem_fetch_hook
+        self.memory_provider = memory_provider
         self.post_session_hook = post_session_hook
         self.config = config
         self.session_id = session_id
@@ -227,64 +241,48 @@ class Orchestrator:
 
     def _process_turn(self, user_input: str) -> str:
         """Execute one full conversation turn and return the assistant response."""
-        # Step 1: pre-mem-fetch — normalise query
-        pre_result = self.pre_mem_fetch_hook.run(user_input)
-        normalised_query = pre_result.message if pre_result.success else user_input
+        normalised_query = _normalize_query(user_input)
 
-        # Step 2: retrieve memory context
-        context, retrieved_keys = self.memory_manager.get_context_with_keys(
-            normalised_query, limit=DEFAULT_RETRIEVAL_LIMIT
+        results = self.memory_provider.search(
+            normalised_query, SearchFilters(limit=DEFAULT_RETRIEVAL_LIMIT)
         )
 
-        if context:
+        if results:
             self.metrics.memory_hits += 1
         else:
             self.metrics.memory_misses += 1
 
-        # Step 3: post-mem-fetch — truncate if needed
-        post_result = self.post_mem_fetch_hook.run(
-            context=context,
-            retrieved_keys=retrieved_keys,
-            query=normalised_query,
+        full_input, dropped = _build_context_input(
+            results, user_input, self.config.max_context_chars
         )
-        context = post_result.message if post_result.success else context
+        if dropped:
+            logger.warning(
+                "orchestrator: dropped memory items to fit context budget",
+                extra={"data": {"dropped": dropped, "kept": len(results) - dropped}},
+            )
 
-        # Step 4: context budget check (§5b)
-        prefix = render_prompt("context_prefix", memory_context=context)
-        full_input = f"{prefix}{user_input}" if prefix.strip() else user_input
+        # Alerts when user_input alone blows past the budget — trimming only covers memory items.
         self._check_context_budget(full_input)
 
-        # Step 5: call agent with timeout
         response_text = self._call_agent_with_timeout(full_input)
 
-        # Step 6: update token/latency metrics (estimated)
         self.metrics.llm_token_count_est += (len(full_input) + len(response_text)) // CHARS_PER_TOKEN
 
-        # Step 7: save turn to memory with timestamp embedded in content so the
-        # LLM can answer temporal questions ("what did I say on Tuesday?").
-        turn_id = f"turn_{self.session_id}_{self.metrics.turn_count}"
         try:
-            ts_str = time.strftime(MEMORY_TIMESTAMP_DISPLAY_FORMAT, time.gmtime())
-            self.memory_manager.save_message(
-                turn_id,
-                f"[{ts_str}]\nUser: {user_input}\nAssistant: {response_text}",
-                {
-                    "type": MEMORY_TYPE_EPISODIC,
-                    "session_id": self.session_id,
-                    "turn": self.metrics.turn_count,
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                },
+            ts_display = time.strftime(MEMORY_TIMESTAMP_DISPLAY_FORMAT, time.gmtime())
+            self.memory_provider.save(
+                f"[{ts_display}]\nUser: {user_input}\nAssistant: {response_text}",
+                type="episodic",
+                topic=self.session_id,
             )
         except Exception as exc:
             logger.warning(
-                "orchestrator: failed to save turn to memory",
-                extra={"data": {"turn_id": turn_id, "error": str(exc)}},
+                "orchestrator: failed to save episodic memory",
+                extra={"data": {"error": str(exc)}},
             )
 
-        # Step 8: update metrics
         self.metrics.turn_count += 1
         self.metrics.turns.append({"user": user_input, "assistant": response_text})
-        self.metrics.eviction_count = self.memory_manager.eviction_count
 
         logger.debug(
             "orchestrator: turn complete",
@@ -307,15 +305,9 @@ class Orchestrator:
         max_calls = self.config.max_tool_calls
         t0 = time.perf_counter()
 
-        # Capture the current ContextVar state (including trace_id) so that the
-        # executor thread inherits it.  Without this, ContextVar values set on
-        # the main thread (e.g. set_trace_id) are invisible to the worker thread
-        # and all tool-call logs would show trace_id="unset".
         ctx: contextvars.Context = contextvars.copy_context()
 
         def _invoke() -> object:
-            # threading.local is per-thread; reset here so each agent invocation
-            # starts with a fresh counter regardless of thread reuse.
             tool_call_counter.count = 0
             tool_call_counter.limit = max_calls
             return ctx.run(self.agent, full_input)
@@ -341,14 +333,7 @@ class Orchestrator:
     def _check_context_budget(self, full_input: str) -> None:
         """
         Emit a critical alert when the injected turn input approaches the
-        configured character limit (§5b).
-
-        Note: Strands manages conversation history internally so we cannot
-        truncate it here.  This alert signals that the operator should either
-        increase max_context_chars or that summarisation is needed.
-
-        ``max_context_chars`` is already a character limit — do NOT multiply
-        it by CHARS_PER_TOKEN here; that would inflate the threshold 4×.
+        configured character limit.
         """
         budget = self.config.max_context_chars
         if len(full_input) > budget * CONTEXT_BUDGET_ALERT_THRESHOLD:
@@ -363,12 +348,19 @@ class Orchestrator:
             )
 
     def _close_session(self) -> None:
-        """Collect final storage metrics then trigger post-session hook."""
+        """Flush remaining dialog, collect storage metrics, run post-session hook."""
         logger.debug("orchestrator: closing session")
+        conv_manager = getattr(self.agent, "conversation_manager", None)
+        flush = getattr(conv_manager, "flush", None)
+        if callable(flush):
+            try:
+                flush(self.agent)
+            except Exception as exc:
+                logger.warning(
+                    "orchestrator: conversation_manager.flush failed",
+                    extra={"data": {"error": str(exc)}},
+                )
         metrics_dict = self.metrics.to_dict()
-        metrics_dict["index_size_bytes"] = self._dir_size(
-            os.path.dirname(self.config.index_path) or "."
-        )
         metrics_dict["storage_size_bytes"] = self._dir_size(self.config.memory_root)
         try:
             self.post_session_hook.run(metrics=metrics_dict)

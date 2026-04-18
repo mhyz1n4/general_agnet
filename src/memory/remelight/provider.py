@@ -15,8 +15,11 @@ V1.1 configuration (FTS-only, stubbed LLM):
 
 Save path writes a YAML-frontmattered ``.md`` file under ``memory/``; the
 ReMeLight file watcher picks it up (sub-second latency in practice) and
-indexes it. Session turns are appended to per-day JSONL files under
-``dialog/``.
+indexes it.
+
+V1.2: session dialog is owned by Strands Agent (``agent.messages``).  Dialog
+persistence methods have been removed — the ``ReMeCompactionManager`` handles
+batch compaction and episodic memory writes.
 """
 
 from __future__ import annotations
@@ -44,7 +47,6 @@ from src.memory.provider import (
     MemoryItem,
     MemoryType,
     Message,
-    ReasoningContext,
     SearchFilters,
     Summary,
 )
@@ -82,7 +84,6 @@ class ReMeLightProvider:
         self._memory_root = Path(memory_root).absolute()
         self._session_id = session_id
         self._memory_write_lock = threading.Lock()
-        self._dialog_lock = threading.Lock()
 
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(
@@ -268,94 +269,6 @@ class ReMeLightProvider:
         )
         kept_texts = {m.get_text_content() for m in messages_to_keep}
         return [m for m in messages if m.get("content", "") in kept_texts]
-
-    def save_session_turn(self, message: Message) -> None:
-        """
-        Append a dialog turn to ``dialog/{YYYY-MM-DD}.jsonl``.
-
-        Missing ``timestamp`` is filled with the current UTC ISO-8601 time;
-        missing or empty ``session_id`` falls back to the provider's
-        configured ``session_id``. Writes are serialised by
-        ``_dialog_lock`` so concurrent saves from this process do not
-        interleave within the file.
-
-        Args:
-            message: Message dict following the ``Message`` TypedDict schema.
-        """
-        now = datetime.now(timezone.utc)
-        date_str = now.strftime(MEMORY_DATE_FOLDER_FORMAT)
-        dialog_dir = self._memory_root / "dialog"
-        dialog_dir.mkdir(parents=True, exist_ok=True)
-        path = dialog_dir / f"{date_str}.jsonl"
-
-        record = {
-            "role": message.get("role", ""),
-            "content": message.get("content", ""),
-            "timestamp": message.get("timestamp") or now.isoformat(),
-            "session_id": message.get("session_id") or self._session_id,
-        }
-        line = json.dumps(record, ensure_ascii=False) + "\n"
-        with self._dialog_lock:
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(line)
-
-    def get_session_history(self, session_id: str) -> list[Message]:
-        """
-        Scan all daily JSONL files and return turns for ``session_id``.
-
-        Malformed lines are logged and skipped. Files are iterated in
-        lexicographic (date) order so the returned history is roughly
-        chronological.
-
-        Args:
-            session_id: Session identifier to filter on.
-
-        Returns:
-            List of persisted message records. Empty when the dialog directory
-            does not exist or no record matches.
-        """
-        dialog_dir = self._memory_root / "dialog"
-        if not dialog_dir.exists():
-            return []
-
-        history: list[Message] = []
-        for jsonl_path in sorted(dialog_dir.glob("*.jsonl")):
-            with jsonl_path.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        logger.warning("Skipping malformed dialog line in %s", jsonl_path)
-                        continue
-                    if record.get("session_id") == session_id:
-                        history.append(record)  # type: ignore[arg-type]
-        return history
-
-    def pre_reasoning_hook(self, context: ReasoningContext) -> ReasoningContext:
-        """
-        Trim ``context.messages`` via ``check_context`` before the LLM call.
-
-        Returns ``context`` unchanged when it has no messages or a non-positive
-        budget. Otherwise emits a fresh ``ReasoningContext`` with the trimmed
-        messages and the original ``memory_items`` / ``budget_tokens``.
-
-        Args:
-            context: Input reasoning context.
-
-        Returns:
-            Possibly a new ``ReasoningContext`` with trimmed messages.
-        """
-        if not context.messages or context.budget_tokens <= 0:
-            return context
-        kept = self.check_context(context.messages, context.budget_tokens)
-        return ReasoningContext(
-            messages=kept,
-            memory_items=context.memory_items,
-            budget_tokens=context.budget_tokens,
-        )
 
     # ------------------------------------------------------------------ #
     # Lifecycle

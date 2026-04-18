@@ -1,48 +1,39 @@
 """
-Memorize sub-agent — multi-step verification wrapper around save_message.
+Memorize sub-agent — multi-step wrapper around MemoryProvider.save().
 
-Per design §6a:
+Per design SS6a (V1.1):
   1. Validate inputs.
-  2. Write to filesystem via MemoryManager.save_message().
-  3. Verify the key was indexed (content hash found in index).
-  4. Return SubAgentResult.
+  2. Write to memory via MemoryProvider.save().
+  3. Return SubAgentResult.
 
-**Status: retained for future use — NOT used by main.py today.**
-
-This module implements the ``MemorizeSubAgent`` class, designed for the planned
-``PostTurnMemoryHook`` pattern: a sub-agent that runs after every conversation
-turn and autonomously decides whether the interaction is worth memorising.
-That hook has not been activated yet (``auto_memory_enabled`` is False in config).
-
-The active memory-save path is ``src/tools/memorize.py`` — a Strands ``@tool``
-closure injected into the agent and called when the user explicitly asks to
-remember something.  Use that module for any work that is live today.
+Post-write verification (content hash check) has been retired — the provider
+handles indexing internally.
 """
 
-import hashlib
 import uuid
-from datetime import datetime, timezone
 from typing import Optional
 
 from src.agents.base import SubAgentResult
-from src.constants import CONTENT_HASH_LENGTH, MEMORY_ID_HEX_LENGTH, VALID_MEMORY_TYPES
+from src.constants import MEMORY_ID_HEX_LENGTH, VALID_MEMORY_TYPES
 from src.logging_config import get_logger
-from src.memory.manager import MemoryManager
-from src.memory.types import MemoryMetadata
+from src.memory.provider import MemoryProvider
 
 logger = get_logger(__name__)
 
 
 class MemorizeSubAgent:
     """
-    Verify-and-save wrapper around MemoryManager for explicit user-directed saves.
-
-    Unlike the Strands @tool (which is atomic), this sub-agent performs a
-    post-write verification step to confirm the entry was indexed successfully.
+    Verify-and-save wrapper around MemoryProvider for explicit user-directed saves.
     """
 
-    def __init__(self, memory_manager: MemoryManager) -> None:
-        self.memory_manager = memory_manager
+    def __init__(self, memory_provider: MemoryProvider) -> None:
+        """
+        Initialise the memorize sub-agent.
+
+        Args:
+            memory_provider: ``MemoryProvider`` implementation to save through.
+        """
+        self.memory_provider = memory_provider
 
     def run(
         self,
@@ -51,7 +42,7 @@ class MemorizeSubAgent:
         topic: str = "",
     ) -> SubAgentResult:
         """
-        Save content to long-term memory and verify it was indexed.
+        Save content to long-term memory via the provider.
 
         Args:
             content:     Text to persist.
@@ -76,51 +67,24 @@ class MemorizeSubAgent:
                 error=f"type must be one of {sorted(VALID_MEMORY_TYPES)}, got '{memory_type}'.",
             )
 
-        message_id = f"{memory_type}_{uuid.uuid4().hex[:MEMORY_ID_HEX_LENGTH]}"
-        metadata: MemoryMetadata = {
-            "type": memory_type,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        if topic.strip():
-            metadata["topic"] = topic.strip()
-
         try:
-            self.memory_manager.save_message(message_id, content.strip(), metadata)
+            item = self.memory_provider.save(
+                content.strip(),
+                type=memory_type,
+                topic=topic.strip() or None,
+            )
         except Exception as exc:
             logger.error(
                 "memorize_agent: save failed",
-                extra={"data": {"message_id": message_id, "error": str(exc)}},
+                extra={"data": {"error": str(exc)}},
             )
             return SubAgentResult(success=False, output="", error=str(exc))
 
-        # Verification: confirm the content hash was indexed.
-        content_hash = hashlib.sha256(content.strip().encode()).hexdigest()[:CONTENT_HASH_LENGTH]
-        verified_key: Optional[str] = None
-        try:
-            verified_key = self.memory_manager.indexer.find_by_content_hash(content_hash)
-        except Exception as exc:
-            logger.warning(
-                "memorize_agent: verification check raised",
-                extra={"data": {"error": str(exc)}},
-            )
-
-        if verified_key is None:
-            # Save appeared to succeed but we cannot confirm indexing.
-            # Return success=True — the DLQ handles actual write failures.
-            logger.warning(
-                "memorize_agent: verification inconclusive — hash not found in index",
-                extra={"data": {"message_id": message_id}},
-            )
-            return SubAgentResult(
-                success=True,
-                output=f"Saved with key {message_id} (index verification inconclusive).",
-            )
-
         logger.debug(
-            "memorize_agent: verified",
-            extra={"data": {"message_id": message_id, "verified_key": verified_key}},
+            "memorize_agent: saved",
+            extra={"data": {"key": item.key, "type": memory_type}},
         )
         return SubAgentResult(
             success=True,
-            output=f"Saved and verified with key: {verified_key}",
+            output=f"Saved with key: {item.key}",
         )

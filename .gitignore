@@ -75,8 +75,10 @@ MANIFEST
 CLAUDE.md
 AI_changes.md
 plan.md
+plan_v1_1_features.md
 .gemini/
 design.md
+design_v1_1.md
 
 # Dot-files and dot-folders (editor state, tool configs, etc.)
 .*

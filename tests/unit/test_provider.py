@@ -13,7 +13,6 @@ import pytest
 from src.memory.provider import (
     MemoryItem,
     MemoryProvider,
-    ReasoningContext,
     SearchFilters,
     Summary,
 )
@@ -84,35 +83,6 @@ class TestSaveAndSearch:
         assert results[0].topic == "work"
 
 
-class TestSessionHistory:
-    """save_session_turn() must be retrievable by session_id; sessions isolated."""
-
-    def test_single_session_roundtrip(self, provider: StubMemoryProvider) -> None:
-        """Turns saved under one session return in insertion order from ``get_session_history``."""
-        provider.save_session_turn(
-            {"role": "user", "content": "hello", "session_id": "s1"}
-        )
-        provider.save_session_turn(
-            {"role": "assistant", "content": "hi", "session_id": "s1"}
-        )
-        history = provider.get_session_history("s1")
-        assert len(history) == 2
-        assert history[0]["content"] == "hello"
-        assert history[1]["content"] == "hi"
-
-    def test_sessions_are_isolated(self, provider: StubMemoryProvider) -> None:
-        """Turns tagged with different ``session_id`` values do not cross-contaminate."""
-        provider.save_session_turn(
-            {"role": "user", "content": "a", "session_id": "s1"}
-        )
-        provider.save_session_turn(
-            {"role": "user", "content": "b", "session_id": "s2"}
-        )
-        assert len(provider.get_session_history("s1")) == 1
-        assert len(provider.get_session_history("s2")) == 1
-        assert provider.get_session_history("s3") == []
-
-
 class TestCompact:
     """compact() produces a Summary containing all source messages."""
 
@@ -158,17 +128,3 @@ class TestCheckContext:
         """A zero-token budget returns an empty list."""
         msgs = [{"role": "user", "content": "hi"}]
         assert provider.check_context(msgs, budget_tokens=0) == []
-
-
-class TestPreReasoningHook:
-    """pre_reasoning_hook() on the stub is a pass-through."""
-
-    def test_passthrough(self, provider: StubMemoryProvider) -> None:
-        """The stub returns the same ``ReasoningContext`` instance it received."""
-        ctx = ReasoningContext(
-            messages=[{"role": "user", "content": "hi"}],
-            memory_items=[],
-            budget_tokens=100,
-        )
-        result = provider.pre_reasoning_hook(ctx)
-        assert result is ctx

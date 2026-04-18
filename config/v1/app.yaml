@@ -1,4 +1,4 @@
-version: v1
+version: v1.2
 
 # -----------------------------------------------------------------------
 # LLM
@@ -11,18 +11,9 @@ llm_model: /model
 llm_max_tokens: 1024
 
 # -----------------------------------------------------------------------
-# Memory (file system)
+# Memory (ReMeLight working directory)
 # -----------------------------------------------------------------------
 memory_root: ./memory
-index_path: ./memory/index.json
-
-# -----------------------------------------------------------------------
-# Redis (short-term session memory)
-# -----------------------------------------------------------------------
-redis_host: localhost
-redis_port: 6379
-redis_ttl: 3600
-session_max_messages: 100
 
 # -----------------------------------------------------------------------
 # Session behaviour
@@ -33,14 +24,13 @@ max_context_chars: 8000
 max_tool_calls: 10
 
 # -----------------------------------------------------------------------
+# Conversation compaction (ReMeCompactionManager)
+# -----------------------------------------------------------------------
+max_conversation_messages: 40
+compact_batch_size: 20
+
+# -----------------------------------------------------------------------
 # Logging  (overridden by config/v1/logging.yaml for log-specific detail)
 # -----------------------------------------------------------------------
 log_dir: ./logs
 log_level: INFO
-
-# -----------------------------------------------------------------------
-# Dead-letter queue
-# -----------------------------------------------------------------------
-dlq_path: ./memory/dlq.jsonl
-dlq_max_attempts: 3
-dlq_retry_interval_seconds: 60

@@ -1,17 +1,18 @@
 """
 MemoryProvider protocol and supporting types.
 
-The V1.1 memory system exposes a single abstraction — ``MemoryProvider`` — so
-the orchestrator can swap backing implementations (ReMeLight now, Mem0 or
-another framework later) without changing any call sites.
+The memory system exposes a single abstraction — ``MemoryProvider`` — so the
+orchestrator and compaction manager can swap backing implementations (ReMeLight
+now, Mem0 or another framework later) without changing call sites.
 
-All cross-provider data flows through the dataclasses defined here. Provider
-implementations translate between these and their native representations.
+Session dialog is owned by Strands Agent (``agent.messages``); the provider
+handles only long-term memory and context-window management via four methods:
+``search``, ``save``, ``compact``, ``check_context``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, Optional, Protocol, Tuple, runtime_checkable
 
 from typing_extensions import TypedDict
@@ -49,15 +50,6 @@ class SearchFilters:
     topics: Optional[Tuple[str, ...]] = None
     date_range: Optional[Tuple[str, str]] = None   # (from_iso, to_iso)
     limit: int = 5
-
-
-@dataclass
-class ReasoningContext:
-    """Input/output of ``MemoryProvider.pre_reasoning_hook``."""
-
-    messages: list[Message] = field(default_factory=list)
-    memory_items: list[MemoryItem] = field(default_factory=list)
-    budget_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -98,17 +90,3 @@ class MemoryProvider(Protocol):
         budget_tokens: int,
     ) -> list[Message]:
         """Return a prefix of ``messages`` that fits within ``budget_tokens``."""
-
-    def save_session_turn(self, message: Message) -> None:
-        """Append a single turn to the active session's dialog log."""
-
-    def get_session_history(self, session_id: str) -> list[Message]:
-        """Load the full dialog history for ``session_id``."""
-
-    def pre_reasoning_hook(self, context: ReasoningContext) -> ReasoningContext:
-        """
-        Adjust ``context`` before the LLM call.
-
-        Typically chains tool-result compaction, context budget enforcement,
-        and async summarisation. Providers MAY return ``context`` unchanged.
-        """

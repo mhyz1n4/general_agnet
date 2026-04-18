@@ -1,10 +1,9 @@
 """
 Unit tests for Config (pydantic-settings).
 
-Verifies that required fields are loaded from environment variables, optional
-fields carry the expected defaults, the vLLM EMPTY API-key fallback works,
-and that fields present in app.yaml resolve from YAML when the env var is
-absent.  monkeypatch is used to avoid touching the real process environment.
+V1.1: Redis, DLQ, and index_path fields have been removed.
+Verifies that required fields are loaded from environment variables,
+optional fields carry expected defaults, and YAML resolution works.
 """
 
 from typing import Dict, Optional
@@ -31,7 +30,6 @@ def _make_env(
         "LLM_MODEL": "claude-sonnet-4-6",
         "LLM_API_KEY": "sk-test",
         "MEMORY_ROOT": "/tmp/mem",
-        "INDEX_PATH": "/tmp/mem/index.json",
     }
     if overrides:
         base.update(overrides)
@@ -42,7 +40,7 @@ def _make_env(
 
 
 def test_config_all_required_fields(monkeypatch: pytest.MonkeyPatch) -> None:
-    """All four required fields must be read from environment variables."""
+    """All required fields must be read from environment variables."""
     from src.config import Config
 
     env: Dict[str, str] = _make_env()
@@ -53,7 +51,6 @@ def test_config_all_required_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.llm_model == "claude-sonnet-4-6"
     assert cfg.llm_api_key == "sk-test"
     assert cfg.memory_root == "/tmp/mem"
-    assert cfg.index_path == "/tmp/mem/index.json"
 
 
 def test_config_defaults_applied(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -65,10 +62,25 @@ def test_config_defaults_applied(monkeypatch: pytest.MonkeyPatch) -> None:
 
     cfg: Config = Config(_env_file=None)
     assert cfg.llm_max_tokens == 1024
-    assert cfg.redis_host == "localhost"
-    assert cfg.redis_port == 6379
-    assert cfg.session_max_messages == 100
-    assert cfg.dlq_max_attempts == 3
+    assert cfg.session_inactivity_timeout_seconds == 300
+    assert cfg.tool_timeout_seconds == 10
+    assert cfg.max_context_chars == 8000
+    assert cfg.max_tool_calls == 10
+
+
+def test_config_no_redis_or_dlq_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """V1.1 Config must not have Redis, DLQ, or index_path fields."""
+    from src.config import Config
+
+    for k, v in _make_env().items():
+        monkeypatch.setenv(k, v)
+
+    cfg: Config = Config(_env_file=None)
+    assert not hasattr(cfg, "redis_host")
+    assert not hasattr(cfg, "redis_port")
+    assert not hasattr(cfg, "dlq_path")
+    assert not hasattr(cfg, "index_path")
+    assert not hasattr(cfg, "session_max_messages")
 
 
 def test_config_api_key_defaults_to_empty_for_vllm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -85,7 +97,7 @@ def test_config_api_key_defaults_to_empty_for_vllm(monkeypatch: pytest.MonkeyPat
     assert cfg.llm_api_key == VLLM_API_KEY
 
 
-@pytest.mark.parametrize("missing_field", ["LLM_MODEL", "MEMORY_ROOT", "INDEX_PATH"])
+@pytest.mark.parametrize("missing_field", ["LLM_MODEL", "MEMORY_ROOT"])
 def test_config_yaml_provides_default_for_field(
     monkeypatch: pytest.MonkeyPatch,
     missing_field: str,
@@ -106,10 +118,9 @@ def test_config_custom_optional_values(monkeypatch: pytest.MonkeyPatch) -> None:
     """Env var overrides for optional fields must take precedence over YAML defaults."""
     from src.config import Config
 
-    env: Dict[str, str] = _make_env(overrides={"REDIS_PORT": "6380", "SESSION_MAX_MESSAGES": "50"})
+    env: Dict[str, str] = _make_env(overrides={"MAX_TOOL_CALLS": "20"})
     for k, v in env.items():
         monkeypatch.setenv(k, v)
 
     cfg: Config = Config(_env_file=None)
-    assert cfg.redis_port == 6380
-    assert cfg.session_max_messages == 50
+    assert cfg.max_tool_calls == 20

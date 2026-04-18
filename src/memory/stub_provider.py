@@ -2,10 +2,10 @@
 In-memory ``MemoryProvider`` implementation for tests.
 
 ``StubMemoryProvider`` keeps everything in RAM: a ``dict[str, MemoryItem]`` for
-saved memories and a ``list[Message]`` per session for dialog history. It has
-no persistence, no indexing, no LLM dependency — substring matching stands in
-for retrieval. Tests use it to exercise the orchestrator against a deterministic
-provider without pulling in ReMeLight.
+saved memories.  It has no persistence, no indexing, no LLM dependency —
+substring matching stands in for retrieval.  Tests use it to exercise the
+orchestrator and compaction manager against a deterministic provider without
+pulling in ReMeLight.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from .provider import (
     MemoryProvider,
     MemoryType,
     Message,
-    ReasoningContext,
     SearchFilters,
     Summary,
 )
@@ -30,9 +29,8 @@ class StubMemoryProvider:
     """Deterministic in-memory provider for unit and integration tests."""
 
     def __init__(self) -> None:
-        """Initialise empty in-memory stores for items and session histories."""
+        """Initialise empty in-memory store for memory items."""
         self._items: dict[str, MemoryItem] = {}
-        self._sessions: dict[str, list[Message]] = {}
 
     def search(self, query: str, filters: SearchFilters) -> list[MemoryItem]:
         """
@@ -139,42 +137,6 @@ class StubMemoryProvider:
         kept.reverse()
         return kept
 
-    def save_session_turn(self, message: Message) -> None:
-        """
-        Append ``message`` to the in-memory history for its session.
-
-        Args:
-            message: Message dict; its ``session_id`` key (empty string when
-                     missing) selects the target history list.
-        """
-        session_id = message.get("session_id", "")
-        self._sessions.setdefault(session_id, []).append(message)
-
-    def get_session_history(self, session_id: str) -> list[Message]:
-        """
-        Return a copy of the message list for ``session_id``.
-
-        Args:
-            session_id: Session identifier to look up.
-
-        Returns:
-            A new list (safe for caller mutation) of stored messages, or an
-            empty list when the session is unknown.
-        """
-        return list(self._sessions.get(session_id, []))
-
-    def pre_reasoning_hook(self, context: ReasoningContext) -> ReasoningContext:
-        """
-        Pass ``context`` through unchanged — the stub applies no pre-reasoning
-        transformations.
-
-        Args:
-            context: Input reasoning context.
-
-        Returns:
-            The same ``ReasoningContext`` instance.
-        """
-        return context
 
 
 # Runtime protocol check: keep the module self-verifying.
