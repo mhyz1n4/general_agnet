@@ -16,14 +16,22 @@ LLM integration tests expect a running vLLM (or OpenAI-compatible) endpoint.
 The URL is taken from LLM_API_ENDPOINT in .env (default: http://localhost:8000/v1).
 
 The ``llm_available`` fixture skips tests when the endpoint is unreachable.
+
+Confirmation mode
+-----------------
+``auto`` confirmation resolves to ``interactive`` when stdin is a TTY.  Under
+``pytest`` stdin is typically still a TTY, which would cause
+``@requires_confirmation`` tools to block on ``input()``.  The autouse
+``_deny_confirmations`` fixture forces ``non_interactive`` (deny-by-default)
+for every test unless the test explicitly overrides it.
 """
 
-import json
 import os
-import time
 from urllib import request as urllib_request
 
 import pytest
+
+from src.tools.confirm import reset_confirmation_mode, set_confirmation_mode
 
 REDIS_TEST_PORT = 6380
 
@@ -121,46 +129,22 @@ def llm_endpoint_or_none():
 
 
 # ---------------------------------------------------------------------------
-# Strands SDK patch — shared by integration and eval harnesses
+# Confirmation mode — deny by default during tests
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def strands_patch():
+@pytest.fixture(autouse=True)
+def _deny_confirmations():
     """
-    Patch Strands SDK to count tool calls and handle vLLM streaming quirks
-    (strands issue #815). Restores the original function after each test.
+    Force ``non_interactive`` (deny-by-default) confirmation mode for tests.
 
-    Lives in the top-level conftest so both integration and eval suites
-    can depend on it without duplicating the patch logic.
+    Without this, ``@requires_confirmation``-decorated tools would attempt to
+    read from stdin when pytest is attached to a TTY, hanging the suite.
+    Tests that need interactive behaviour can override by calling
+    ``set_confirmation_mode("interactive")`` inside the test body.
     """
+    token = set_confirmation_mode("non_interactive")
     try:
-        import strands.tools.tools as _strands_tools
-        import strands.event_loop.streaming as _strands_streaming
-        from strands.tools.tools import InvalidToolUseNameException
-        from src.orchestrator import tool_call_counter
-
-        _orig = _strands_tools.validate_tool_use_name
-
-        def _safe(tool: dict) -> None:
-            """Guarded replacement for ``validate_tool_use_name``."""
-            count = getattr(tool_call_counter, "count", 0) + 1
-            limit = getattr(tool_call_counter, "limit", 0)
-            tool_call_counter.count = count
-            if limit and count > limit:
-                raise InvalidToolUseNameException(
-                    f"tool call limit reached ({count}/{limit})"
-                )
-            if not tool.get("name"):
-                raise InvalidToolUseNameException(
-                    "tool name is None or empty (strands #815)"
-                )
-            _orig(tool)
-
-        _strands_tools.validate_tool_use_name = _safe
-        _strands_streaming.validate_tool_use_name = _safe
         yield
-        _strands_tools.validate_tool_use_name = _orig
-        _strands_streaming.validate_tool_use_name = _orig
-    except ImportError:
-        yield
+    finally:
+        reset_confirmation_mode(token)
 

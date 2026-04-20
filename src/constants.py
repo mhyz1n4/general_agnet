@@ -140,3 +140,26 @@ VLLM_API_KEY: str = "EMPTY"
 DEFAULT_TAVILY_ENDPOINT: str = "https://api.tavily.com/search"
 DEFAULT_TAVILY_TIMEOUT_SECONDS: int = 10
 DEFAULT_TAVILY_MAX_RESULTS: int = 5
+
+# ---------------------------------------------------------------------------
+# Per-tool budget defaults
+# Per-turn caps protecting against runaway loops.  The global
+# DEFAULT_MAX_TOOL_CALLS still bounds the total call count per turn.
+# ---------------------------------------------------------------------------
+
+DEFAULT_TOOL_BUDGET_WEB_SEARCH: int = 10
+DEFAULT_TOOL_BUDGET_RUN_PYTHON: int = 2
+DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH: int = 1
+
+# ---------------------------------------------------------------------------
+# Research sub-agent defaults
+# ---------------------------------------------------------------------------
+
+# Per-delegation cap on tool calls inside the research sub-agent.  Keeps a
+# stuck sub-agent from consuming the parent's per-turn budget.
+DEFAULT_SUB_AGENT_MAX_TOOL_CALLS: int = 3
+
+# Wall-clock timeout (seconds) applied to each ``delegate_to_research``
+# invocation.  Enforced by the module-level executor in
+# ``src/agents/research.py``.
+DEFAULT_SUB_AGENT_TIMEOUT_SECONDS: int = 30

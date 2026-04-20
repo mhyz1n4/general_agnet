@@ -30,6 +30,31 @@ max_conversation_messages: 40
 compact_batch_size: 20
 
 # -----------------------------------------------------------------------
+# Risky-action confirmation (V1.1 M4).
+# "auto" resolves to interactive on TTY, non_interactive (deny) otherwise.
+# -----------------------------------------------------------------------
+tool_confirmation_mode: auto
+
+# -----------------------------------------------------------------------
+# Python code execution (V1.1 M6).
+# Default OFF — the subprocess+rlimit sandbox is NOT a security boundary.
+# Only enable in trusted deployments where arbitrary-code-exec risk is
+# already accepted.
+# -----------------------------------------------------------------------
+enable_code_exec: false
+run_python_timeout_seconds: 10
+run_python_memory_bytes: 268435456   # 256 MiB
+run_python_max_output_bytes: 65536   # 64 KiB
+
+# -----------------------------------------------------------------------
+# Research sub-agent (V1.1 M5)
+# Each delegate_to_research call runs the sub-agent in its own worker
+# thread with an independent tool-call budget and wall-clock timeout.
+# -----------------------------------------------------------------------
+sub_agent_max_tool_calls: 3
+sub_agent_timeout_seconds: 30
+
+# -----------------------------------------------------------------------
 # Logging  (overridden by config/v1/logging.yaml for log-specific detail)
 # -----------------------------------------------------------------------
 log_dir: ./logs

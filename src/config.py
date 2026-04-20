@@ -31,8 +31,13 @@ from src.constants import (
     DEFAULT_STRANDS_LOG_LEVEL,
     DEFAULT_MAX_CONTEXT_CHARS,
     DEFAULT_SESSION_INACTIVITY_TIMEOUT,
+    DEFAULT_SUB_AGENT_MAX_TOOL_CALLS,
+    DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
     DEFAULT_TAVILY_ENDPOINT,
     DEFAULT_TAVILY_TIMEOUT_SECONDS,
+    DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH,
+    DEFAULT_TOOL_BUDGET_RUN_PYTHON,
+    DEFAULT_TOOL_BUDGET_WEB_SEARCH,
     DEFAULT_TOOL_TIMEOUT_SECONDS,
     VLLM_API_KEY,
     VLLM_BASE_URL,
@@ -151,15 +156,37 @@ class Config(BaseSettings):
     log_level: str = DEFAULT_LOG_LEVEL
     strands_log_level: str = DEFAULT_STRANDS_LOG_LEVEL
 
-    # External tools — Tavily web search (V1.1 M2). Tool unregisters when
-    # token is unset so the agent never sees a broken web_search.
+    # External tools — Tavily web search.  Tool unregisters when the token
+    # is unset so the agent never sees a broken web_search.
     tavily_search_token: Optional[str] = None
     tavily_search_endpoint: str = DEFAULT_TAVILY_ENDPOINT
     tavily_search_timeout_seconds: int = DEFAULT_TAVILY_TIMEOUT_SECONDS
 
-    # Risky-action confirmation (V1.1 M4). ``auto`` picks interactive when
-    # stdin is a TTY, otherwise non_interactive (which denies by default).
+    # Risky-action confirmation.  ``auto`` picks interactive when stdin is
+    # a TTY, otherwise non_interactive (which denies by default).
     tool_confirmation_mode: str = "auto"
+
+    # Python code execution.  Default OFF — the sandbox is subprocess+rlimit,
+    # which is NOT a security boundary.  Operators who enable this in any
+    # deployment with an untrusted prompt path accept arbitrary-code-execution
+    # risk.
+    enable_code_exec: bool = False
+    run_python_timeout_seconds: int = 10
+    run_python_memory_bytes: int = 256 * 1024 * 1024
+    run_python_max_output_bytes: int = 64 * 1024
+
+    # Per-tool budgets — each is a per-turn cap.  ``max_tool_calls`` still
+    # bounds the total; these provide tighter limits for specific tools.
+    tool_budget_web_search: int = DEFAULT_TOOL_BUDGET_WEB_SEARCH
+    tool_budget_run_python: int = DEFAULT_TOOL_BUDGET_RUN_PYTHON
+    tool_budget_delegate_to_research: int = DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH
+
+    # Research sub-agent — bounds the sub-agent's own per-delegation
+    # tool-call count and wall-clock runtime.  Kept independent from the
+    # parent's ``max_tool_calls`` so a stuck sub-agent can't starve the
+    # main loop.
+    sub_agent_max_tool_calls: int = DEFAULT_SUB_AGENT_MAX_TOOL_CALLS
+    sub_agent_timeout_seconds: int = DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
 
     model_config = SettingsConfigDict(
         env_file=".env",

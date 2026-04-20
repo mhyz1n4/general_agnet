@@ -15,7 +15,10 @@ from strands import tool
 from src.constants import VALID_MEMORY_TYPES
 from src.logging_config import get_logger
 from src.memory.provider import MemoryItem, MemoryProvider, MemoryType, SearchFilters
+from src.tools.cache import cached_tool
 from src.tools.envelope import ToolResult, err, ok
+
+TOOL_NAME = "search_memory"
 
 logger = get_logger(__name__)
 
@@ -47,6 +50,7 @@ def create_search_memory_tool(memory_provider: MemoryProvider):
     """
 
     @tool
+    @cached_tool(TOOL_NAME)
     def search_memory(
         query: str,
         type: Optional[Literal["episodic", "semantic", "procedural"]] = None,

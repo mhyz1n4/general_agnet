@@ -34,12 +34,15 @@ pytestmark = pytest.mark.llm
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def agent_ctx(llm_available, session_id, strands_patch):
+def agent_ctx(llm_available, session_id):
     """
     Build a real Strands Agent wired to a StubMemoryProvider.
 
     Requires ``llm_available`` — this fixture (and every test that depends on
     it) is automatically skipped when the vLLM endpoint is unreachable.
+
+    Tool-call budgeting is wired through ``ToolBudgetHookProvider`` +
+    ``AgentStateContext`` (the Orchestrator would do the same at runtime).
     """
     try:
         from strands import Agent
@@ -47,7 +50,8 @@ def agent_ctx(llm_available, session_id, strands_patch):
     except ImportError:
         pytest.skip("strands-agents package not installed")
 
-    from src.orchestrator import tool_call_counter
+    from src.agents.context import AgentStateContext
+    from src.hooks.tool_budget import ToolBudgetHookProvider
 
     config = Config()
     provider = StubMemoryProvider()
@@ -67,10 +71,9 @@ def agent_ctx(llm_available, session_id, strands_patch):
         tools=[memorize_tool],
         system_prompt=system_prompt,
         callback_handler=None,
+        hooks=[ToolBudgetHookProvider()],
     )
-
-    tool_call_counter.count = 0
-    tool_call_counter.limit = config.max_tool_calls
+    agent.state_context = AgentStateContext(max_tool_calls=config.max_tool_calls)
 
     return {
         "agent": agent,
@@ -91,11 +94,7 @@ _THINKING_RE = re.compile(
 
 def _call_agent(agent_ctx: dict, user_input: str) -> str:
     """Call the agent and return the cleaned response."""
-    from src.orchestrator import tool_call_counter
-
-    tool_call_counter.count = 0
-    tool_call_counter.limit = agent_ctx["config"].max_tool_calls
-
+    agent_ctx["agent"].state_context.reset()
     response = agent_ctx["agent"](user_input)
     return _THINKING_RE.sub("", str(response)).strip()
 
@@ -161,9 +160,8 @@ def test_memory_retrieval(agent_ctx):
     The agent must incorporate the fact in its response.
     """
     from src.hooks.post_session import PostSessionHook
-    from src.orchestrator import Orchestrator, tool_call_counter
+    from src.orchestrator import Orchestrator
     from rich.console import Console
-    import os
 
     provider = agent_ctx["provider"]
     config = agent_ctx["config"]
@@ -187,9 +185,6 @@ def test_memory_retrieval(agent_ctx):
         session_id=session_id,
         console=Console(quiet=True),
     )
-
-    tool_call_counter.count = 0
-    tool_call_counter.limit = config.max_tool_calls
 
     response = orchestrator._process_turn("When is Sarah's birthday?")
 

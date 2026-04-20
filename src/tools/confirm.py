@@ -70,7 +70,7 @@ def _resolve_mode(explicit: Optional[Mode]) -> Mode:
 def confirm_or_deny(
     action_description: str,
     mode: Optional[Mode] = None,
-    input_fn: Callable[[str], str] = input,
+    input_fn: Optional[Callable[[str], str]] = None,
 ) -> bool:
     """
     Ask the user whether to proceed with ``action_description``.
@@ -79,8 +79,10 @@ def confirm_or_deny(
         action_description: One-line summary of what the tool is about to do.
         mode:               Force a specific mode; ``None`` defers to the
                             ContextVar override or stdin auto-detect.
-        input_fn:           Callable used to read the user's answer
+        input_fn:           Optional callable used to read the user's answer
                             (dependency-injected so tests can provide a stub).
+                            ``None`` resolves to the builtin ``input`` at call
+                            time so monkeypatching ``builtins.input`` works.
 
     Returns:
         ``True`` if the user affirmed (interactive mode only) or
@@ -94,9 +96,10 @@ def confirm_or_deny(
         )
         return False
 
+    reader = input_fn if input_fn is not None else input
     prompt = f"[confirm] {action_description} [y/N]: "
     try:
-        answer = input_fn(prompt)
+        answer = reader(prompt)
     except (EOFError, KeyboardInterrupt):
         logger.warning(
             "confirm_or_deny: denied (stdin closed or interrupted)",

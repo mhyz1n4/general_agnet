@@ -20,7 +20,6 @@ import concurrent.futures
 import contextvars
 import os
 import re
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -29,21 +28,25 @@ from typing import Callable, List, Optional
 from rich.console import Console
 from rich.markdown import Markdown
 
+from src.agents.context import AgentStateContext
 from src.config import Config
 from src.constants import (
     CHARS_PER_TOKEN,
     CONSECUTIVE_FAILURES_BEFORE_GRACEFUL,
     CONTEXT_BUDGET_ALERT_THRESHOLD,
-    DEFAULT_MAX_TOOL_CALLS,
     DEFAULT_RETRIEVAL_LIMIT,
+    DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH,
+    DEFAULT_TOOL_BUDGET_RUN_PYTHON,
+    DEFAULT_TOOL_BUDGET_WEB_SEARCH,
     EXIT_COMMANDS,
     MEMORY_TIMESTAMP_DISPLAY_FORMAT,
 )
 from src.hooks.post_session import PostSessionHook
-from src.logging_config import get_logger, set_trace_id
+from src.logging_config import get_logger, get_trace_id, set_trace_id
 from src.memory.provider import MemoryItem, MemoryProvider, SearchFilters
 from src.memory.types import SessionMetricsDict, TurnRecord
 from src.prompts.loader import render_prompt
+from src.tools.cache import SessionToolCache, set_session_cache
 
 logger = get_logger(__name__)
 
@@ -52,8 +55,6 @@ _GRACEFUL_ERROR = (
     "Please try again or rephrase your message."
 )
 
-# Thread-local state used by the Strands #815 workaround patch in main.py.
-tool_call_counter = threading.local()  # attrs: count (int), limit (int)
 
 _THINKING_TAG_RE = re.compile(r"<think(?:ing)?>\s*.*?\s*</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
 
@@ -122,6 +123,8 @@ class SessionMetrics:
     llm_latency_ms: float = 0.0
     tool_calls_made: int = 0
     tool_failures: int = 0
+    cache_hits: int = 0
+    cache_read_input_tokens: int = 0
     turns: List[TurnRecord] = field(default_factory=list)
 
     def to_dict(self) -> SessionMetricsDict:
@@ -140,6 +143,8 @@ class SessionMetrics:
             "llm_latency_ms": round(self.llm_latency_ms, 1),
             "tool_calls_made": self.tool_calls_made,
             "tool_failures": self.tool_failures,
+            "cache_hits": self.cache_hits,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
             "turns": self.turns,
         }
 
@@ -178,6 +183,16 @@ class Orchestrator:
         self.metrics = SessionMetrics()
         self._last_input_time = time.time()
         self._consecutive_failures: int = 0
+        self._tool_cache = SessionToolCache()
+
+        # Attach an ``AgentStateContext`` if the caller didn't bring one.
+        # ``enforce_tool_budget`` (wired via ``ToolBudgetHookProvider``) reads
+        # this on every ``BeforeToolCallEvent``.
+        if getattr(self.agent, "state_context", None) is None:
+            self.agent.state_context = AgentStateContext(
+                max_tool_calls=getattr(self.config, "max_tool_calls", 0) or 0,
+                per_tool_limits=self._per_tool_budget(),
+            )
 
     def run(self) -> None:
         """Main chat loop."""
@@ -268,8 +283,8 @@ class Orchestrator:
 
         self.metrics.llm_token_count_est += (len(full_input) + len(response_text)) // CHARS_PER_TOKEN
 
+        ts_display = time.strftime(MEMORY_TIMESTAMP_DISPLAY_FORMAT, time.gmtime())
         try:
-            ts_display = time.strftime(MEMORY_TIMESTAMP_DISPLAY_FORMAT, time.gmtime())
             self.memory_provider.save(
                 f"[{ts_display}]\nUser: {user_input}\nAssistant: {response_text}",
                 type="episodic",
@@ -280,6 +295,24 @@ class Orchestrator:
                 "orchestrator: failed to save episodic memory",
                 extra={"data": {"error": str(exc)}},
             )
+
+        # One episodic entry per tool invoked, tagged with the tool name so
+        # future retrieval can filter by topic.  Tool names come from the
+        # ``enforce_tool_budget`` hook, which appends every successful call
+        # to ``state_context.tools_invoked``.
+        tool_names = self.agent.state_context.unique_tools_invoked()
+        for tool_name in tool_names:
+            try:
+                self.memory_provider.save(
+                    f"[{ts_display}] tool={tool_name} summary: {response_text}",
+                    type="episodic",
+                    topic=tool_name,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "orchestrator: tool-summary write-back failed",
+                    extra={"data": {"tool": tool_name, "error": str(exc)}},
+                )
 
         self.metrics.turn_count += 1
         self.metrics.turns.append({"user": user_input, "assistant": response_text})
@@ -302,18 +335,26 @@ class Orchestrator:
         )
 
         timeout = self.config.tool_timeout_seconds
-        max_calls = self.config.max_tool_calls
         t0 = time.perf_counter()
 
         ctx: contextvars.Context = contextvars.copy_context()
+        # Bind the per-session cache on the copied context so @cached_tool
+        # decorators can find it on the worker thread.
+        ctx.run(set_session_cache, self._tool_cache)
+
+        # Reset the agent's state context for this turn.  The hook populated
+        # by ``ToolBudgetHookProvider`` will read it on every tool call.
+        state = self.agent.state_context
+        state.reset(trace_id=get_trace_id())
 
         def _invoke() -> object:
-            tool_call_counter.count = 0
-            tool_call_counter.limit = max_calls
+            """Run the agent inside the copied context and roll up metrics."""
+            hits_before = self._tool_cache.hits
             try:
                 return ctx.run(self.agent, full_input)
             finally:
-                self.metrics.tool_calls_made += getattr(tool_call_counter, "count", 0)
+                self.metrics.tool_calls_made += state.tool_call_count
+                self.metrics.cache_hits += self._tool_cache.hits - hits_before
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_invoke)
@@ -325,6 +366,15 @@ class Orchestrator:
                 )
         elapsed_ms = (time.perf_counter() - t0) * 1000
         self.metrics.llm_latency_ms += elapsed_ms
+
+        # Strands ``accumulated_usage`` is cumulative across the session, so
+        # we assign rather than add.  Backends without cache-control support
+        # (e.g. local vLLM) leave the field absent/zero.
+        usage = getattr(
+            getattr(self.agent, "event_loop_metrics", None), "accumulated_usage", None
+        )
+        if isinstance(usage, dict):
+            self.metrics.cache_read_input_tokens = int(usage.get("cacheReadInputTokens", 0) or 0)
 
         raw_response = str(response)
         logger.debug(
@@ -372,6 +422,27 @@ class Orchestrator:
                 "orchestrator: post-session hook error",
                 extra={"data": {"error": str(exc)}},
             )
+
+    def _per_tool_budget(self) -> dict:
+        """
+        Return the per-tool call budget dict, pulled from the active Config.
+
+        Missing config fields fall back to the module defaults so tests that
+        use ``MagicMock(spec=Config)`` without setting every knob keep working.
+        """
+        return {
+            "web_search": getattr(
+                self.config, "tool_budget_web_search", DEFAULT_TOOL_BUDGET_WEB_SEARCH
+            ),
+            "run_python": getattr(
+                self.config, "tool_budget_run_python", DEFAULT_TOOL_BUDGET_RUN_PYTHON
+            ),
+            "delegate_to_research": getattr(
+                self.config,
+                "tool_budget_delegate_to_research",
+                DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH,
+            ),
+        }
 
     @staticmethod
     def _dir_size(path: str) -> int:

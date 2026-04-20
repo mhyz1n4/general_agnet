@@ -243,6 +243,26 @@ class TestCallAgentWithTimeout:
         assert result == "Clean answer"
         assert "<think>" not in result
 
+    def test_cache_hits_propagate_to_metrics(self) -> None:
+        """Cache hits recorded during an agent turn land on ``SessionMetrics``."""
+        from src.tools.cache import cached_tool, get_session_cache
+        from src.tools.envelope import ok
+
+        @cached_tool("stub_tool")
+        def _stub(x: int) -> dict:
+            """Tool stub used to drive cache insertion from within an agent call."""
+            return ok({"x": x})
+
+        def _agent(_input: str) -> str:
+            """Agent that calls the cached stub twice — second call should hit."""
+            _stub(x=1)
+            _stub(x=1)
+            return "done"
+
+        orch = _make_orchestrator(agent=_agent)
+        orch._call_agent_with_timeout("test")
+        assert orch.metrics.cache_hits == 1
+
 
 # ---------------------------------------------------------------------------
 # _process_turn

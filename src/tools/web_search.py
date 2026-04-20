@@ -26,7 +26,10 @@ from src.constants import (
     DEFAULT_TAVILY_TIMEOUT_SECONDS,
 )
 from src.logging_config import get_logger
+from src.tools.cache import cached_tool
 from src.tools.envelope import ToolResult, err, ok
+
+TOOL_NAME = "web_search"
 
 logger = get_logger(__name__)
 
@@ -83,6 +86,7 @@ def create_web_search_tool(
     """
 
     @tool
+    @cached_tool(TOOL_NAME)
     def web_search(query: str, max_results: int = DEFAULT_TAVILY_MAX_RESULTS) -> ToolResult:
         """
         Search the public web for recent, relevant information on ``query``.
@@ -128,10 +132,20 @@ def create_web_search_tool(
                 return err(f"search failed: {message}", status=status)
 
             results: List[Dict[str, Any]] = list(body.get("results") or [])
+            trimmed = results[:clamped]
+            logger.info(
+                "web_search: completed",
+                extra={"data": {
+                    "query_len": len(payload["query"]),
+                    "result_count": len(trimmed),
+                    "status": status,
+                    "attempt": attempt,
+                }},
+            )
             return ok(
-                results[:clamped],
+                trimmed,
                 query=payload["query"],
-                result_count=len(results[:clamped]),
+                result_count=len(trimmed),
             )
 
         return err("search failed after retry")

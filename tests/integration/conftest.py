@@ -11,8 +11,10 @@ memory_provider — StubMemoryProvider instance
 session_id   — unique session ID per test
 agent_or_mock — real Strands Agent when LLM is reachable, else a MagicMock
 
-``strands_patch`` is provided by the top-level ``tests/conftest.py`` and is
-shared with the eval harness.
+Tool-budget enforcement is wired via ``ToolBudgetHookProvider`` +
+``AgentStateContext`` (see ``src/hooks/tool_budget.py`` and
+``src/agents/context.py``).  Integration tests that drive an Agent directly
+attach their own ``AgentStateContext`` when they need budget enforcement.
 
 Test data
 ---------
@@ -132,10 +134,13 @@ def session_id() -> str:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def agent_or_mock(llm_endpoint_or_none, strands_patch):
+def agent_or_mock(llm_endpoint_or_none):
     """
     Return a real Strands Agent when the LLM endpoint is reachable, else a
     ``MagicMock`` that returns a fixed response string.
+
+    The Agent is built with ``ToolBudgetHookProvider`` so any attached
+    ``AgentStateContext`` participates in per-turn budget enforcement.
     """
     if llm_endpoint_or_none is None:
         return MagicMock(return_value="This is the assistant response.")
@@ -146,12 +151,11 @@ def agent_or_mock(llm_endpoint_or_none, strands_patch):
     except ImportError:
         return MagicMock(return_value="This is the assistant response.")
 
+    from src.agents.context import AgentStateContext
     from src.config import Config
-    from src.orchestrator import tool_call_counter
+    from src.hooks.tool_budget import ToolBudgetHookProvider
 
     config = Config()
-    tool_call_counter.count = 0
-    tool_call_counter.limit = config.max_tool_calls
 
     model = OpenAIModel(
         client_args={
@@ -161,4 +165,11 @@ def agent_or_mock(llm_endpoint_or_none, strands_patch):
         model_id=config.llm_model,
         params={"max_tokens": max(config.llm_max_tokens, 4096)},
     )
-    return Agent(model=model, tools=[], callback_handler=None)
+    agent = Agent(
+        model=model,
+        tools=[],
+        callback_handler=None,
+        hooks=[ToolBudgetHookProvider()],
+    )
+    agent.state_context = AgentStateContext(max_tool_calls=config.max_tool_calls)
+    return agent

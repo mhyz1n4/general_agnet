@@ -13,18 +13,26 @@ from datetime import datetime, timezone
 
 from rich.console import Console
 
+from src.agents.context import AgentStateContext
 from src.config import Config
 from src.logging_config import get_logger, init_session_logging
 from src.memory.remelight.compaction_manager import ReMeCompactionManager
 from src.memory.remelight.provider import ReMeLightProvider
 from src.hooks.pre_session import PreSessionHook
 from src.hooks.post_session import PostSessionHook
+from src.hooks.tool_budget import ToolBudgetHookProvider
 from src.prompts.loader import render_prompt
+from src.agents.research import create_research_agent_tool
+from src.tools.confirm import set_confirmation_mode
 from src.tools.memorize import create_memorize_tool
+from src.tools.run_python import create_run_python_tool_from_config
 from src.tools.search_memory import create_search_memory_tool
 from src.tools.web_search import create_web_search_tool_from_config
 from src.constants import (
     DEFAULT_METRICS_FILENAME,
+    DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH,
+    DEFAULT_TOOL_BUDGET_RUN_PYTHON,
+    DEFAULT_TOOL_BUDGET_WEB_SEARCH,
     SESSION_ID_HEX_LENGTH,
     SESSION_LOG_DATE_FORMAT,
     SESSION_LOG_SUBDIR_PREFIX,
@@ -53,6 +61,10 @@ def main() -> None:
     logger = get_logger(__name__)
 
     logger.info("main: starting session", extra={"data": {"session_id": session_id}})
+
+    # Propagate the configured confirmation mode to the ContextVar so every
+    # @requires_confirmation-decorated tool picks it up.
+    set_confirmation_mode(config.tool_confirmation_mode)  # type: ignore[arg-type]
 
     # --- Memory provider (ReMeLight) ---
     memory_provider = ReMeLightProvider(
@@ -92,49 +104,26 @@ def main() -> None:
         console.print("[red]strands-agents package not installed. Run: pip install strands-agents[/red]")
         sys.exit(1)
 
-    # Workaround for strands-agents issue #815
-    import strands.tools.tools as _strands_tools
-    import strands.event_loop.streaming as _strands_streaming
-    from strands.tools.tools import InvalidToolUseNameException
-    from src.orchestrator import tool_call_counter
-
-    _patch_logger = get_logger(__name__)
-
-    def _safe_validate_tool_use_name(tool: dict) -> None:
-        """Guarded replacement for ``validate_tool_use_name``."""
-        count = getattr(tool_call_counter, "count", 0) + 1
-        limit = getattr(tool_call_counter, "limit", 0)
-        tool_call_counter.count = count
-        if limit and count > limit:
-            _patch_logger.warning(
-                "strands: tool call limit exceeded",
-                extra={"data": {"count": count, "limit": limit}},
-            )
-            raise InvalidToolUseNameException(
-                f"tool call limit reached ({count}/{limit}); stopping agent loop"
-            )
-
-        if not tool.get("name"):
-            _patch_logger.warning(
-                "strands #815: tool use with None/empty name intercepted",
-                extra={"data": {"tool_use_id": tool.get("toolUseId"), "tool": str(tool)}},
-            )
-            raise InvalidToolUseNameException("tool name is None or empty (strands issue #815)")
-        _orig_validate_tool_use_name(tool)
-
-    _orig_validate_tool_use_name = _strands_tools.validate_tool_use_name
-    _strands_tools.validate_tool_use_name = _safe_validate_tool_use_name
-    _strands_streaming.validate_tool_use_name = _safe_validate_tool_use_name
-
     memorize_tool = create_memorize_tool(memory_provider, session_id=session_id)
     search_memory_tool = create_search_memory_tool(memory_provider)
     web_search_tool = create_web_search_tool_from_config(config)
+    research_tool = create_research_agent_tool(memory_provider, config)
+    run_python_tool = create_run_python_tool_from_config(config)
     system_prompt = render_prompt("system_prompt")
 
     agent_tools = [memorize_tool, search_memory_tool]
     if web_search_tool is not None:
         agent_tools.append(web_search_tool)
+    if research_tool is not None:
+        agent_tools.append(research_tool)
+    if run_python_tool is not None:
+        agent_tools.append(run_python_tool)
 
+    # Prompt caching is transparent on OpenAI-compatible backends (OpenAI,
+    # vLLM with --enable-prefix-caching).  On Anthropic-compatible proxies
+    # Strands surfaces cacheReadInputTokens via
+    # ``agent.event_loop_metrics.accumulated_usage``; the Orchestrator reads
+    # it into ``SessionMetrics.cache_read_input_tokens`` at end-of-turn.
     model = OpenAIModel(
         client_args={
             "api_key": config.llm_api_key,
@@ -154,6 +143,27 @@ def main() -> None:
         system_prompt=system_prompt,
         conversation_manager=compaction_manager,
         callback_handler=None,
+        hooks=[ToolBudgetHookProvider()],
+    )
+
+    # Attach the per-loop state context so ``enforce_tool_budget`` (registered
+    # via ``ToolBudgetHookProvider``) has budgets to consult on every tool
+    # call.  The Orchestrator resets counters at the start of each turn.
+    agent.state_context = AgentStateContext(
+        max_tool_calls=config.max_tool_calls,
+        per_tool_limits={
+            "web_search": getattr(
+                config, "tool_budget_web_search", DEFAULT_TOOL_BUDGET_WEB_SEARCH
+            ),
+            "run_python": getattr(
+                config, "tool_budget_run_python", DEFAULT_TOOL_BUDGET_RUN_PYTHON
+            ),
+            "delegate_to_research": getattr(
+                config,
+                "tool_budget_delegate_to_research",
+                DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH,
+            ),
+        },
     )
 
     # --- Hooks ---

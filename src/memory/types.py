@@ -34,6 +34,8 @@ class SessionMetricsDict(TypedDict, total=False):
     llm_latency_ms: float
     tool_calls_made: int
     tool_failures: int
+    cache_hits: int
+    cache_read_input_tokens: int
     storage_size_bytes: int
     turns: List[TurnRecord]
 

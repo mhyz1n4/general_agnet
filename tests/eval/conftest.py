@@ -14,10 +14,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.agents.context import AgentStateContext
 from src.config import Config
 from src.hooks.post_session import PostSessionHook
+from src.hooks.tool_budget import ToolBudgetHookProvider
 from src.memory.stub_provider import StubMemoryProvider
-from src.orchestrator import Orchestrator, tool_call_counter
+from src.orchestrator import Orchestrator
 from tests.eval import load_fixtures
 
 
@@ -35,23 +37,33 @@ def eval_fixtures() -> List[Dict[str, Any]]:
 
 
 def _build_agent(endpoint: str, config: Config):
-    """Construct a minimal Strands Agent wired to the live LLM endpoint."""
+    """
+    Construct a minimal Strands Agent wired to the live LLM endpoint.
+
+    Budget enforcement is installed via ``ToolBudgetHookProvider`` and a
+    fresh ``AgentStateContext`` attached to the agent — the Orchestrator
+    will leave it in place and reset it per turn.
+    """
     from strands import Agent
     from strands.models.openai import OpenAIModel
-
-    tool_call_counter.count = 0
-    tool_call_counter.limit = config.max_tool_calls
 
     model = OpenAIModel(
         client_args={"api_key": config.llm_api_key, "base_url": endpoint},
         model_id=config.llm_model,
         params={"max_tokens": max(config.llm_max_tokens, 4096)},
     )
-    return Agent(model=model, tools=[], callback_handler=None)
+    agent = Agent(
+        model=model,
+        tools=[],
+        callback_handler=None,
+        hooks=[ToolBudgetHookProvider()],
+    )
+    agent.state_context = AgentStateContext(max_tool_calls=config.max_tool_calls)
+    return agent
 
 
 @pytest.fixture
-def eval_orchestrator(llm_endpoint_or_none, strands_patch, tmp_path):
+def eval_orchestrator(llm_endpoint_or_none, tmp_path):
     """
     Factory fixture: returns a callable that builds a fresh orchestrator per
     fixture, optionally preseeding the stub memory provider with a list of
