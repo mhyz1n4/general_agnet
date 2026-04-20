@@ -58,13 +58,28 @@ def create_search_memory_tool(memory_provider: MemoryProvider):
         limit: int = 10,
     ) -> ToolResult:
         """
-        Search long-term memory for items matching ``query`` and the given filters.
+        Retrieve prior conversation turns, facts, and preferences from
+        long-term memory.
+
+        **When to call this tool:** call it whenever the user refers to prior
+        conversations, asks "what did we discuss", "do you remember",
+        "earlier today", "the full chat history", or any question that could
+        plausibly be answered by something saved in memory. Call it even if
+        some memory is already injected into the prompt under
+        ``[Relevant Memory]`` — the auto-injected slice is capped at a few
+        items and may be missing the entries the user actually wants. Prefer
+        ``limit=15`` or higher for chat-history recall questions, and pass
+        ``type="episodic"`` when asking about past conversations.
+
+        Do NOT answer a history question from the auto-injected context
+        alone if the answer would be incomplete — call this tool first.
 
         Args:
             query: Free-text query; case-insensitive substring match on stored content.
             type:  Optional memory-type filter (episodic/semantic/procedural).
             topic: Optional topic-tag filter.
-            limit: Maximum number of items to return (1..25).
+            limit: Maximum number of items to return (1..25). Use 15+ for
+                   chat-history recall.
 
         Returns:
             ``ToolResult`` envelope.  ``data`` is a list of matching memory dicts

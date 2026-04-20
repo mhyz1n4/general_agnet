@@ -29,7 +29,7 @@ from src.orchestrator import Orchestrator
 def _make_orchestrator(agent: Callable, provider=None) -> Orchestrator:
     """Build an Orchestrator with a MagicMock Config and optional stub provider."""
     cfg = MagicMock(spec=Config)
-    cfg.tool_timeout_seconds = 5
+    cfg.agent_turn_timeout_seconds = 5
     cfg.max_tool_calls = 20
     cfg.max_context_chars = 8000
     cfg.tool_budget_web_search = 10

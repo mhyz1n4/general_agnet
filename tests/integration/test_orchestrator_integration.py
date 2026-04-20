@@ -31,7 +31,7 @@ def orchestrator(agent_or_mock, tmp_path):
     config = MagicMock()
     config.session_inactivity_timeout_seconds = 300
     config.max_context_chars = 8000
-    config.tool_timeout_seconds = 30
+    config.agent_turn_timeout_seconds = 30
     config.max_tool_calls = 5
     config.memory_root = str(tmp_path / "memory")
 

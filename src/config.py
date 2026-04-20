@@ -18,10 +18,12 @@ import os
 from typing import Dict, Optional, Tuple, Type, Union
 
 import yaml
+from pydantic import Field
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from src.constants import (
+    DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     DEFAULT_COMPACT_BATCH_SIZE,
     DEFAULT_LLM_MAX_TOKENS,
     DEFAULT_LOG_DIR,
@@ -34,11 +36,9 @@ from src.constants import (
     DEFAULT_SUB_AGENT_MAX_TOOL_CALLS,
     DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
     DEFAULT_TAVILY_ENDPOINT,
-    DEFAULT_TAVILY_TIMEOUT_SECONDS,
     DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH,
     DEFAULT_TOOL_BUDGET_RUN_PYTHON,
     DEFAULT_TOOL_BUDGET_WEB_SEARCH,
-    DEFAULT_TOOL_TIMEOUT_SECONDS,
     VLLM_API_KEY,
     VLLM_BASE_URL,
     VLLM_MODEL_ID,
@@ -143,7 +143,10 @@ class Config(BaseSettings):
 
     # Session behaviour
     session_inactivity_timeout_seconds: int = DEFAULT_SESSION_INACTIVITY_TIMEOUT
-    tool_timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS
+    # Wall-clock cap on a single agent.__call__ — the full LLM ↔ tool loop
+    # for one user turn.  Per-tool HTTP/subprocess timeouts are constants
+    # inside the tool modules themselves, not knobs.
+    agent_turn_timeout_seconds: int = DEFAULT_AGENT_TURN_TIMEOUT_SECONDS
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS
 
@@ -156,11 +159,13 @@ class Config(BaseSettings):
     log_level: str = DEFAULT_LOG_LEVEL
     strands_log_level: str = DEFAULT_STRANDS_LOG_LEVEL
 
-    # External tools — Tavily web search.  Tool unregisters when the token
-    # is unset so the agent never sees a broken web_search.
-    tavily_search_token: Optional[str] = None
+    # External tools — Tavily web search.  Token is read from the
+    # ``TAVILY_SEARCH_TOKEN`` env var by default; tool unregisters when the
+    # token is unset so the agent never sees a broken web_search.
+    tavily_search_token: Optional[str] = Field(
+        default_factory=lambda: os.environ.get("TAVILY_SEARCH_TOKEN")
+    )
     tavily_search_endpoint: str = DEFAULT_TAVILY_ENDPOINT
-    tavily_search_timeout_seconds: int = DEFAULT_TAVILY_TIMEOUT_SECONDS
 
     # Risky-action confirmation.  ``auto`` picks interactive when stdin is
     # a TTY, otherwise non_interactive (which denies by default).
@@ -169,11 +174,9 @@ class Config(BaseSettings):
     # Python code execution.  Default OFF — the sandbox is subprocess+rlimit,
     # which is NOT a security boundary.  Operators who enable this in any
     # deployment with an untrusted prompt path accept arbitrary-code-execution
-    # risk.
+    # risk.  Subprocess timeouts and rlimits are constants inside
+    # ``src/tools/run_python.py`` — not knobs.
     enable_code_exec: bool = False
-    run_python_timeout_seconds: int = 10
-    run_python_memory_bytes: int = 256 * 1024 * 1024
-    run_python_max_output_bytes: int = 64 * 1024
 
     # Per-tool budgets — each is a per-turn cap.  ``max_tool_calls`` still
     # bounds the total; these provide tighter limits for specific tools.

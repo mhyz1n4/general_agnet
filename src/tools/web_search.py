@@ -23,7 +23,6 @@ from strands import tool
 from src.constants import (
     DEFAULT_TAVILY_ENDPOINT,
     DEFAULT_TAVILY_MAX_RESULTS,
-    DEFAULT_TAVILY_TIMEOUT_SECONDS,
 )
 from src.logging_config import get_logger
 from src.tools.cache import cached_tool
@@ -35,6 +34,9 @@ logger = get_logger(__name__)
 
 _MAX_RESULTS_HARD_CAP = 20
 _RETRYABLE_STATUS = {500, 502, 503, 504}
+# Per-request HTTP timeout for the Tavily call.  Treated like an HTTP-client
+# timeout: a fixed implementation detail, not an operator knob.
+_HTTP_TIMEOUT_SECONDS = 10
 
 
 def _post_json(
@@ -69,7 +71,6 @@ def _post_json(
 def create_web_search_tool(
     api_token: str,
     endpoint: str = DEFAULT_TAVILY_ENDPOINT,
-    timeout_seconds: int = DEFAULT_TAVILY_TIMEOUT_SECONDS,
 ):
     """
     Create a Strands @tool that performs a Tavily web search.
@@ -77,7 +78,6 @@ def create_web_search_tool(
     Args:
         api_token:        Tavily API key.
         endpoint:         Tavily search endpoint URL.
-        timeout_seconds:  Per-request wall-clock timeout.
 
     Returns:
         A Strands tool function that returns a ``ToolResult`` envelope.  The
@@ -111,7 +111,7 @@ def create_web_search_tool(
 
         for attempt in range(2):
             try:
-                status, body = _post_json(endpoint, payload, timeout_seconds)
+                status, body = _post_json(endpoint, payload, _HTTP_TIMEOUT_SECONDS)
             except urllib.error.URLError as net_err:
                 logger.warning(
                     "web_search: transport error",
@@ -166,5 +166,4 @@ def create_web_search_tool_from_config(config) -> Optional[Any]:
     return create_web_search_tool(
         api_token=config.tavily_search_token,
         endpoint=config.tavily_search_endpoint,
-        timeout_seconds=config.tavily_search_timeout_seconds,
     )

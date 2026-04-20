@@ -135,12 +135,16 @@ def test_generic_subprocess_error_is_caught(tool) -> None:
 
 
 def test_stdout_is_truncated_past_max_output_bytes() -> None:
-    """Oversized stdout is clipped and the ``truncated`` flag flips."""
+    """Oversized stdout is clipped and the ``truncated`` flag flips.
+
+    The truncation cap is now a module-level constant, so we monkeypatch it
+    for the test rather than passing a factory argument.
+    """
     token = set_confirmation_mode("interactive")
     try:
-        tool = rp.create_run_python_tool(enable=True, max_output_bytes=16)
+        tool = rp.create_run_python_tool(enable=True)
         big = "x" * 100
-        with patch.object(
+        with patch.object(rp, "_MAX_OUTPUT_BYTES", 16), patch.object(
             rp.subprocess, "run", return_value=_fake_completed(stdout=big)
         ):
             result = tool(code="print('x' * 100)")
@@ -163,7 +167,7 @@ def test_timeout_is_capped_at_hard_limit(tool) -> None:
     with patch.object(rp.subprocess, "run", side_effect=_capture):
         tool(code="print(1)", timeout_s=9999)
 
-    assert captured["timeout"] == rp._DEFAULT_TIMEOUT_CAP
+    assert captured["timeout"] == rp._TIMEOUT_CAP_SECONDS
 
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,6 @@ def cfg() -> SimpleNamespace:
         llm_max_tokens=2048,
         tavily_search_token=None,
         tavily_search_endpoint="https://api.tavily.com/search",
-        tavily_search_timeout_seconds=10,
         sub_agent_max_tool_calls=3,
         sub_agent_timeout_seconds=30,
     )

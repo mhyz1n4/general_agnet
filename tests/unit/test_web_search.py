@@ -139,7 +139,6 @@ def test_factory_returns_none_when_token_missing() -> None:
     cfg = SimpleNamespace(
         tavily_search_token=None,
         tavily_search_endpoint="https://api.tavily.com/search",
-        tavily_search_timeout_seconds=10,
     )
     assert ws.create_web_search_tool_from_config(cfg) is None
 
@@ -149,7 +148,6 @@ def test_factory_returns_callable_when_token_present() -> None:
     cfg = SimpleNamespace(
         tavily_search_token="t",
         tavily_search_endpoint="https://api.tavily.com/search",
-        tavily_search_timeout_seconds=10,
     )
     tool = ws.create_web_search_tool_from_config(cfg)
     assert tool is not None

@@ -138,7 +138,7 @@ def create_research_agent_tool(
 
         future = _DELEGATION_EXECUTOR.submit(lambda: str(sub_agent(query)))
         try:
-            return future.result(timeout=timeout_s)
+            result = future.result(timeout=timeout_s)
         except concurrent.futures.TimeoutError:
             # Cancel the bookkeeping; the worker thread itself cannot be
             # killed but is abandoned — the next delegation will queue
@@ -159,5 +159,16 @@ def create_research_agent_tool(
                 extra={"data": {"error": str(exc)}},
             )
             return f"delegate_to_research: sub-agent error: {exc}"
+
+        logger.info(
+            "delegate_to_research: completed",
+            extra={"data": {
+                "query_preview": query[:QUERY_LOG_PREVIEW_LENGTH],
+                "sub_agent_tool_calls": sub_agent.state_context.tool_call_count,
+                "result_len": len(result),
+                "timeout_s": timeout_s,
+            }},
+        )
+        return result
 
     return delegate_to_research

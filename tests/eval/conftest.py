@@ -89,7 +89,7 @@ def eval_orchestrator(llm_endpoint_or_none, tmp_path):
 
         cfg = MagicMock(spec=Config)
         cfg.session_inactivity_timeout_seconds = config.session_inactivity_timeout_seconds
-        cfg.tool_timeout_seconds = config.tool_timeout_seconds
+        cfg.agent_turn_timeout_seconds = config.agent_turn_timeout_seconds
         cfg.max_context_chars = config.max_context_chars
         cfg.max_tool_calls = config.max_tool_calls
         cfg.llm_max_tokens = config.llm_max_tokens

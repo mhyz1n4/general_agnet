@@ -43,7 +43,7 @@ def _make_orchestrator(agent: Callable = None, max_context_chars: int = 8000) ->
         A fully constructed Orchestrator with StubMemoryProvider and mocked hooks.
     """
     cfg = MagicMock(spec=Config)
-    cfg.tool_timeout_seconds = 5
+    cfg.agent_turn_timeout_seconds = 5
     cfg.max_tool_calls = 10
     cfg.max_context_chars = max_context_chars
 
@@ -224,14 +224,14 @@ class TestCallAgentWithTimeout:
         assert "hello world" in result
 
     def test_timeout_raises_timeout_error(self) -> None:
-        """An agent that takes longer than tool_timeout_seconds must raise TimeoutError."""
+        """An agent that exceeds agent_turn_timeout_seconds must raise TimeoutError."""
         def slow_agent(x: str) -> str:
             """Simulate a hung agent."""
             time.sleep(10)
             return "never"
 
         orch = _make_orchestrator(agent=slow_agent)
-        orch.config.tool_timeout_seconds = 0.1
+        orch.config.agent_turn_timeout_seconds = 0.1
 
         with pytest.raises(TimeoutError):
             orch._call_agent_with_timeout("test")

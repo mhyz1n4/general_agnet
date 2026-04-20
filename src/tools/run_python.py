@@ -32,7 +32,15 @@ from src.tools.envelope import ToolResult, err, ok
 
 logger = get_logger(__name__)
 
-_DEFAULT_TIMEOUT_CAP = 30  # never let the model override past this
+# Per-call subprocess limits.  Treated like rlimit defaults — fixed
+# implementation details, not operator knobs.  If a deployment ever needs to
+# tune these, promote to Config; until then, hard-coded keeps the surface area
+# small and the values close to the code that enforces them.
+_DEFAULT_TIMEOUT_SECONDS = 10
+_TIMEOUT_CAP_SECONDS = 30        # never let the model override past this
+_MEMORY_BYTES = 256 * 1024 * 1024  # 256 MiB address space
+_FILE_SIZE_BYTES = 1 * 1024 * 1024  # 1 MiB per-file write cap
+_MAX_OUTPUT_BYTES = 64 * 1024     # truncate stdout/stderr above this
 _CONFIRM_DESCRIPTION = "execute Python code on the host"
 
 
@@ -53,13 +61,7 @@ def _make_preexec(memory_bytes: int, cpu_seconds: int, file_size_bytes: int):
     return _apply
 
 
-def create_run_python_tool(
-    enable: bool,
-    default_timeout_s: int = 10,
-    memory_bytes: int = 256 * 1024 * 1024,
-    file_size_bytes: int = 1 * 1024 * 1024,
-    max_output_bytes: int = 64 * 1024,
-):
+def create_run_python_tool(enable: bool):
     """
     Build the ``run_python`` tool, or return ``None`` when the feature is off.
 
@@ -93,13 +95,13 @@ def create_run_python_tool(
         if not code.strip():
             return err("code cannot be empty")
 
-        timeout = min(int(timeout_s or default_timeout_s), _DEFAULT_TIMEOUT_CAP)
+        timeout = min(int(timeout_s or _DEFAULT_TIMEOUT_SECONDS), _TIMEOUT_CAP_SECONDS)
         preexec = _make_preexec(
-            memory_bytes=memory_bytes,
+            memory_bytes=_MEMORY_BYTES,
             # CPU rlimit slightly higher than wall-clock so wall-timeout
             # surfaces first with a clean ``TimeoutExpired`` error.
             cpu_seconds=timeout + 5,
-            file_size_bytes=file_size_bytes,
+            file_size_bytes=_FILE_SIZE_BYTES,
         )
 
         logger.info(
@@ -132,11 +134,11 @@ def create_run_python_tool(
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
         truncated = False
-        if len(stdout) > max_output_bytes:
-            stdout = stdout[:max_output_bytes]
+        if len(stdout) > _MAX_OUTPUT_BYTES:
+            stdout = stdout[:_MAX_OUTPUT_BYTES]
             truncated = True
-        if len(stderr) > max_output_bytes:
-            stderr = stderr[:max_output_bytes]
+        if len(stderr) > _MAX_OUTPUT_BYTES:
+            stderr = stderr[:_MAX_OUTPUT_BYTES]
             truncated = True
 
         data = {
@@ -171,7 +173,4 @@ def create_run_python_tool_from_config(config):
     """Factory convenience: build run_python from a Config instance."""
     return create_run_python_tool(
         enable=getattr(config, "enable_code_exec", False),
-        default_timeout_s=getattr(config, "run_python_timeout_seconds", 10),
-        memory_bytes=getattr(config, "run_python_memory_bytes", 256 * 1024 * 1024),
-        max_output_bytes=getattr(config, "run_python_max_output_bytes", 64 * 1024),
     )

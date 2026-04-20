@@ -40,6 +40,7 @@ from src.constants import (
     DEFAULT_TOOL_BUDGET_WEB_SEARCH,
     EXIT_COMMANDS,
     MEMORY_TIMESTAMP_DISPLAY_FORMAT,
+    METRICS_FLUSH_INTERVAL_TURNS,
 )
 from src.hooks.post_session import PostSessionHook
 from src.logging_config import get_logger, get_trace_id, set_trace_id
@@ -56,15 +57,34 @@ _GRACEFUL_ERROR = (
 )
 
 
-_THINKING_TAG_RE = re.compile(r"<think(?:ing)?>\s*.*?\s*</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+_THINKING_TAG_RE = re.compile(r"<think(?:ing)?>\s*(.*?)\s*</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
 
 _QUERY_NORMALIZE_RE = re.compile(r"[^a-zA-Z0-9\s']")
 _WHITESPACE_COLLAPSE_RE = re.compile(r"\s+")
 
 
+def _split_thinking(text: str) -> tuple[str, str]:
+    """
+    Separate chain-of-thought blocks from the user-visible response.
+
+    The model may emit one or more ``<think>...</think>`` (or ``<thinking>``)
+    spans; we surface them in logs and on the console for transparency, but
+    strip them from whatever is persisted to memory so the CoT trace does
+    not pollute long-term storage.
+
+    Returns:
+        ``(thinking, visible)`` — ``thinking`` concatenates all CoT spans
+        separated by blank lines (empty string if none); ``visible`` is the
+        cleaned response with CoT spans removed.
+    """
+    thoughts = [m.strip() for m in _THINKING_TAG_RE.findall(text) if m.strip()]
+    visible = _THINKING_TAG_RE.sub("", text).strip()
+    return "\n\n".join(thoughts), visible
+
+
 def _strip_thinking(text: str) -> str:
-    """Remove CoT thinking blocks from *text* and return the cleaned string."""
-    return _THINKING_TAG_RE.sub("", text).strip()
+    """Backwards-compatible helper that returns only the visible portion."""
+    return _split_thinking(text)[1]
 
 
 def _normalize_query(query: str) -> str:
@@ -244,6 +264,9 @@ class Orchestrator:
                     )
                     self._consecutive_failures = 0
                     self.console.print(f"\n[red]Assistant:[/red] {_GRACEFUL_ERROR}\n")
+                    # Snapshot metrics so the failure isn't lost if the user
+                    # closes the terminal without typing ``exit``.
+                    self._flush_metrics_snapshot()
                 else:
                     self.console.print(f"[red]Error:[/red] {exc}")
                 continue
@@ -251,6 +274,14 @@ class Orchestrator:
             self.console.print("\n[bold cyan]Assistant:[/bold cyan]")
             self.console.print(Markdown(response))
             self.console.print()
+
+            # Periodic snapshot — bounds metric loss to N turns when the
+            # process is killed without a clean exit.
+            if (
+                self.metrics.turn_count > 0
+                and self.metrics.turn_count % METRICS_FLUSH_INTERVAL_TURNS == 0
+            ):
+                self._flush_metrics_snapshot()
 
         self._close_session()
 
@@ -279,7 +310,16 @@ class Orchestrator:
         # Alerts when user_input alone blows past the budget — trimming only covers memory items.
         self._check_context_budget(full_input)
 
-        response_text = self._call_agent_with_timeout(full_input)
+        raw_response = self._call_agent_with_timeout(full_input)
+        thinking, response_text = _split_thinking(raw_response)
+
+        # Thinking goes to logs + console only — never to memory.  Logged at
+        # INFO so it lands in ``agent.jsonl`` alongside tool traces.
+        if thinking:
+            logger.info(
+                "orchestrator: model thinking",
+                extra={"data": {"thinking_len": len(thinking), "thinking": thinking}},
+            )
 
         self.metrics.llm_token_count_est += (len(full_input) + len(response_text)) // CHARS_PER_TOKEN
 
@@ -321,7 +361,7 @@ class Orchestrator:
             "orchestrator: turn complete",
             extra={"data": {"turn": self.metrics.turn_count}},
         )
-        return response_text
+        return thinking, response_text
 
     def _call_agent_with_timeout(self, full_input: str) -> str:
         """
@@ -334,7 +374,7 @@ class Orchestrator:
             extra={"data": {"input_len": len(full_input), "input": full_input}},
         )
 
-        timeout = self.config.tool_timeout_seconds
+        timeout = self.config.agent_turn_timeout_seconds
         t0 = time.perf_counter()
 
         ctx: contextvars.Context = contextvars.copy_context()
@@ -381,7 +421,7 @@ class Orchestrator:
             "orchestrator: raw LLM response",
             extra={"data": {"response_len": len(raw_response), "response": raw_response}},
         )
-        return _strip_thinking(raw_response)
+        return raw_response
 
     def _check_context_budget(self, full_input: str) -> None:
         """
@@ -413,6 +453,18 @@ class Orchestrator:
                     "orchestrator: conversation_manager.flush failed",
                     extra={"data": {"error": str(exc)}},
                 )
+        self._flush_metrics_snapshot()
+
+    def _flush_metrics_snapshot(self) -> None:
+        """
+        Append the current metrics dict to ``metrics.jsonl``.
+
+        Called periodically from the main loop and on graceful failure so
+        that an abrupt process exit (no ``exit`` command, terminal closed)
+        loses at most ``METRICS_FLUSH_INTERVAL_TURNS`` turns of metrics.
+        Each call appends one line — the file is a time-series; the last
+        line is the most current snapshot.
+        """
         metrics_dict = self.metrics.to_dict()
         metrics_dict["storage_size_bytes"] = self._dir_size(self.config.memory_root)
         try:

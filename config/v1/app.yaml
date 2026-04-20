@@ -19,7 +19,10 @@ memory_root: ./memory
 # Session behaviour
 # -----------------------------------------------------------------------
 session_inactivity_timeout_seconds: 300
-tool_timeout_seconds: 10
+# Wall-clock cap on a single agent.__call__ — covers the full LLM ↔ tool
+# loop for one user turn.  Per-tool HTTP/subprocess timeouts are constants
+# inside the tool modules themselves, not knobs.
+agent_turn_timeout_seconds: 60
 max_context_chars: 8000
 max_tool_calls: 10
 
@@ -36,15 +39,13 @@ compact_batch_size: 20
 tool_confirmation_mode: auto
 
 # -----------------------------------------------------------------------
-# Python code execution (V1.1 M6).
+# Python code execution.
 # Default OFF — the subprocess+rlimit sandbox is NOT a security boundary.
 # Only enable in trusted deployments where arbitrary-code-exec risk is
-# already accepted.
+# already accepted.  Subprocess timeout, memory cap, and output cap are
+# constants inside src/tools/run_python.py — not YAML knobs.
 # -----------------------------------------------------------------------
 enable_code_exec: false
-run_python_timeout_seconds: 10
-run_python_memory_bytes: 268435456   # 256 MiB
-run_python_max_output_bytes: 65536   # 64 KiB
 
 # -----------------------------------------------------------------------
 # Research sub-agent (V1.1 M5)

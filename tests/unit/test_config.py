@@ -63,7 +63,7 @@ def test_config_defaults_applied(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg: Config = Config(_env_file=None)
     assert cfg.llm_max_tokens == 1024
     assert cfg.session_inactivity_timeout_seconds == 300
-    assert cfg.tool_timeout_seconds == 10
+    assert cfg.agent_turn_timeout_seconds == 60
     assert cfg.max_context_chars == 8000
     assert cfg.max_tool_calls == 10
 

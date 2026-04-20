@@ -112,7 +112,7 @@ def test_orchestrator_turn_overhead_p50_under_200ms(seeded_provider, tmp_path):
 
     cfg = MagicMock(spec=Config)
     cfg.session_inactivity_timeout_seconds = 300
-    cfg.tool_timeout_seconds = 30
+    cfg.agent_turn_timeout_seconds = 30
     cfg.max_context_chars = 8000
     cfg.max_tool_calls = 10
     cfg.llm_max_tokens = 1024
@@ -145,7 +145,7 @@ def test_orchestrator_turn_overhead_p95_under_200ms(seeded_provider, tmp_path):
 
     cfg = MagicMock(spec=Config)
     cfg.session_inactivity_timeout_seconds = 300
-    cfg.tool_timeout_seconds = 30
+    cfg.agent_turn_timeout_seconds = 30
     cfg.max_context_chars = 8000
     cfg.max_tool_calls = 10
     cfg.llm_max_tokens = 1024

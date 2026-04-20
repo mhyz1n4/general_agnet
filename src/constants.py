@@ -98,11 +98,17 @@ LLM_PING_MAX_TOKENS: int = 1    # minimal completion used to validate the API ke
 # ---------------------------------------------------------------------------
 
 DEFAULT_SESSION_INACTIVITY_TIMEOUT: int = 300   # seconds
-DEFAULT_TOOL_TIMEOUT_SECONDS: int = 10
+# Wall-clock cap on a single agent.__call__: covers the full LLM ↔ tool loop
+# for one user turn, not a single tool call.  Per-tool timeouts live inside
+# the tool modules themselves (e.g. _HTTP_TIMEOUT_SECONDS in web_search.py).
+DEFAULT_AGENT_TURN_TIMEOUT_SECONDS: int = 60
 DEFAULT_MAX_CONTEXT_CHARS: int = 8000
 DEFAULT_MAX_TOOL_CALLS: int = 10   # max tool-call retries per agent invocation
 DEFAULT_MAX_CONVERSATION_MESSAGES: int = 40   # triggers compaction (matches Strands default)
 DEFAULT_COMPACT_BATCH_SIZE: int = 20          # messages per compaction batch
+# Cadence at which the orchestrator appends a metrics snapshot to
+# ``metrics.jsonl`` between session-end flushes.
+METRICS_FLUSH_INTERVAL_TURNS: int = 5
 
 # ---------------------------------------------------------------------------
 # File paths
@@ -138,7 +144,6 @@ VLLM_API_KEY: str = "EMPTY"
 # ---------------------------------------------------------------------------
 
 DEFAULT_TAVILY_ENDPOINT: str = "https://api.tavily.com/search"
-DEFAULT_TAVILY_TIMEOUT_SECONDS: int = 10
 DEFAULT_TAVILY_MAX_RESULTS: int = 5
 
 # ---------------------------------------------------------------------------

@@ -59,7 +59,10 @@ If none clearly apply: do not read any SKILL.md.
 {% endif %}
 
 ## Memory Context
-When relevant memory is found, it will appear at the start of the user's message wrapped in `[Relevant Memory]` tags. Use this context to give more accurate and personalised responses.
+When relevant memory is found, it will appear at the start of the user's message wrapped in `[Relevant Memory]` tags. This auto-injection is capped at a few items — when the user asks about prior conversations or chat history, treat `[Relevant Memory]` as a **hint** and call `search_memory` to retrieve the full set before answering.
+
+## When to call `search_memory`
+Call `search_memory` whenever the user's message involves recalling something from the past: "what did we discuss", "do you remember", "earlier today", "the full chat history of X", "our previous conversation about Y", etc. Use `limit=15` or higher and pass `type="episodic"` for conversation recall. Do not answer these questions from the auto-injected slice alone.
 
 ## Examples
 
@@ -71,7 +74,12 @@ User: How do I set up a Python virtual environment?
 Assistant: Run `python -m venv .venv` then activate it with `source .venv/bin/activate` (Linux/Mac) or `.venv\Scripts\activate` (Windows).
 
 User: What did we talk about yesterday?
-Assistant: Let me check my memory... [uses retrieved context if available] Based on our previous conversation, we discussed [topic].
+Assistant: [calls search_memory(query="yesterday conversation topics", type="episodic", limit=15)]
+Based on the retrieved conversation history: we discussed [topic] …
+
+User: Do you have the full chat history of the Iran search?
+Assistant: [calls search_memory(query="Iran news search", type="episodic", limit=20)]
+Here is the full Iran-search thread from earlier: …
 
 {% if user_timezone is defined and user_timezone %}
 ## Current date & time

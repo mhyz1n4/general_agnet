@@ -33,7 +33,7 @@ from src.orchestrator import Orchestrator
 def _make_orchestrator(agent: Callable) -> Orchestrator:
     """Build an Orchestrator with a MagicMock Config honouring per-tool fields."""
     cfg = MagicMock(spec=Config)
-    cfg.tool_timeout_seconds = 5
+    cfg.agent_turn_timeout_seconds = 5
     cfg.max_tool_calls = 20
     cfg.max_context_chars = 8000
     cfg.tool_budget_web_search = 2
@@ -210,7 +210,7 @@ class TestOrchestratorAttachesStateContext:
 
         my_agent = _Agent()
         cfg = MagicMock(spec=Config)
-        cfg.tool_timeout_seconds = 5
+        cfg.agent_turn_timeout_seconds = 5
         cfg.max_tool_calls = 3
         cfg.max_context_chars = 8000
         cfg.tool_budget_web_search = 10
