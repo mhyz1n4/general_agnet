@@ -130,6 +130,19 @@ WRITE_TEST_CONTENT: str = "ok"
 CONTEXT_BLOCK_DELIMITER: str = "--- Memory ---"
 MEMORY_TIMESTAMP_DISPLAY_FORMAT: str = "%Y-%m-%d %H:%M UTC"  # embedded in stored content for LLM readability
 
+# Truncation cap for compacted episodic write-back: keep entries small enough
+# to fit many in a single retrieval window without dominating context.
+TURN_SUMMARY_MAX_CHARS: int = 280
+
+# ---------------------------------------------------------------------------
+# Raw-turn archive
+# Full-fidelity user/assistant transcript appended once per turn.  Lives next
+# to ``memory_root`` so it ships with backups but is excluded from search.
+# ---------------------------------------------------------------------------
+
+ARCHIVE_DIR_NAME: str = "archive"
+ARCHIVE_SESSION_FILENAME_FORMAT: str = "session_{session_id}.jsonl"
+
 # ---------------------------------------------------------------------------
 # Local vLLM server (OpenAI-compatible)
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ Design features:
 
 import concurrent.futures
 import contextvars
+import json
 import os
 import re
 import time
@@ -31,6 +32,8 @@ from rich.markdown import Markdown
 from src.agents.context import AgentStateContext
 from src.config import Config
 from src.constants import (
+    ARCHIVE_DIR_NAME,
+    ARCHIVE_SESSION_FILENAME_FORMAT,
     CHARS_PER_TOKEN,
     CONSECUTIVE_FAILURES_BEFORE_GRACEFUL,
     CONTEXT_BUDGET_ALERT_THRESHOLD,
@@ -41,6 +44,7 @@ from src.constants import (
     EXIT_COMMANDS,
     MEMORY_TIMESTAMP_DISPLAY_FORMAT,
     METRICS_FLUSH_INTERVAL_TURNS,
+    TURN_SUMMARY_MAX_CHARS,
 )
 from src.hooks.post_session import PostSessionHook
 from src.logging_config import get_logger, get_trace_id, set_trace_id
@@ -92,6 +96,17 @@ def _normalize_query(query: str) -> str:
     cleaned = _QUERY_NORMALIZE_RE.sub("", query)
     cleaned = cleaned.lower()
     return _WHITESPACE_COLLAPSE_RE.sub(" ", cleaned).strip()
+
+
+def _compact_turn_summary(user_input: str, response_text: str, ts_display: str) -> str:
+    """Build a short, retrieval-friendly summary of one turn.
+
+    Caps both halves at ``TURN_SUMMARY_MAX_CHARS`` so a noisy turn cannot
+    bloat the episodic store; full fidelity lives in the per-session archive.
+    """
+    user_brief = user_input[:TURN_SUMMARY_MAX_CHARS]
+    assistant_brief = response_text[:TURN_SUMMARY_MAX_CHARS]
+    return f"[{ts_display}]\nUser: {user_brief}\nAssistant: {assistant_brief}"
 
 
 def _build_context_input(
@@ -204,6 +219,7 @@ class Orchestrator:
         self._last_input_time = time.time()
         self._consecutive_failures: int = 0
         self._tool_cache = SessionToolCache()
+        self._archive_path: Optional[str] = self._resolve_archive_path()
 
         # Attach an ``AgentStateContext`` if the caller didn't bring one.
         # ``enforce_tool_budget`` (wired via ``ToolBudgetHookProvider``) reads
@@ -324,9 +340,16 @@ class Orchestrator:
         self.metrics.llm_token_count_est += (len(full_input) + len(response_text)) // CHARS_PER_TOKEN
 
         ts_display = time.strftime(MEMORY_TIMESTAMP_DISPLAY_FORMAT, time.gmtime())
+        tool_names = self.agent.state_context.unique_tools_invoked()
+
+        # Full fidelity goes to the per-session archive; episodic memory
+        # gets a compacted form so retrieval stays cheap.
+        self._append_raw_turn(user_input, response_text, tool_names, ts_display)
+
+        compact_summary = _compact_turn_summary(user_input, response_text, ts_display)
         try:
             self.memory_provider.save(
-                f"[{ts_display}]\nUser: {user_input}\nAssistant: {response_text}",
+                compact_summary,
                 type="episodic",
                 topic=self.session_id,
             )
@@ -336,15 +359,14 @@ class Orchestrator:
                 extra={"data": {"error": str(exc)}},
             )
 
-        # One episodic entry per tool invoked, tagged with the tool name so
-        # future retrieval can filter by topic.  Tool names come from the
-        # ``enforce_tool_budget`` hook, which appends every successful call
-        # to ``state_context.tools_invoked``.
-        tool_names = self.agent.state_context.unique_tools_invoked()
+        # One topic-tagged entry per unique tool, also compacted.  Tool names
+        # come from the ``enforce_tool_budget`` hook, which appends every
+        # successful call to ``state_context.tools_invoked``.
+        clipped_response = response_text[:TURN_SUMMARY_MAX_CHARS]
         for tool_name in tool_names:
             try:
                 self.memory_provider.save(
-                    f"[{ts_display}] tool={tool_name} summary: {response_text}",
+                    f"[{ts_display}] tool={tool_name} summary: {clipped_response}",
                     type="episodic",
                     topic=tool_name,
                 )
@@ -361,7 +383,7 @@ class Orchestrator:
             "orchestrator: turn complete",
             extra={"data": {"turn": self.metrics.turn_count}},
         )
-        return thinking, response_text
+        return response_text
 
     def _call_agent_with_timeout(self, full_input: str) -> str:
         """
@@ -473,6 +495,51 @@ class Orchestrator:
             logger.error(
                 "orchestrator: post-session hook error",
                 extra={"data": {"error": str(exc)}},
+            )
+
+    def _resolve_archive_path(self) -> Optional[str]:
+        """Return the per-session archive jsonl path, or None when unavailable.
+
+        Returns ``None`` when ``config.memory_root`` is missing or non-string
+        (e.g. ``MagicMock`` in unit tests that don't exercise this code path).
+        """
+        root = getattr(self.config, "memory_root", None)
+        if not isinstance(root, str) or not root:
+            return None
+        filename = ARCHIVE_SESSION_FILENAME_FORMAT.format(session_id=self.session_id)
+        return os.path.join(root, ARCHIVE_DIR_NAME, filename)
+
+    def _append_raw_turn(
+        self,
+        user_input: str,
+        response_text: str,
+        tool_names: List[str],
+        timestamp: str,
+    ) -> None:
+        """Append one full-fidelity turn record to the per-session archive.
+
+        Failures are swallowed with a warning so a disk-full or permission
+        problem cannot abort the chat loop.  No-op when the archive path
+        could not be resolved (see :py:meth:`_resolve_archive_path`).
+        """
+        if not self._archive_path:
+            return
+        record = {
+            "timestamp": timestamp,
+            "trace_id": get_trace_id(),
+            "session_id": self.session_id,
+            "user": user_input,
+            "assistant": response_text,
+            "tools_invoked": list(tool_names),
+        }
+        try:
+            os.makedirs(os.path.dirname(self._archive_path), exist_ok=True)
+            with open(self._archive_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.warning(
+                "orchestrator: failed to append raw turn to archive",
+                extra={"data": {"error": str(exc), "path": self._archive_path}},
             )
 
     def _per_tool_budget(self) -> dict:
