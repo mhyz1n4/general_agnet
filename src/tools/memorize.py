@@ -1,46 +1,30 @@
 """
 Memorize tool — Strands @tool closure for saving information to long-term memory.
 
-**Status: active — this is the memory-save path used by main.py.**
-
-The tool is created once per session via ``create_memorize_tool(memory_manager)``
-and injected into the Strands ``Agent`` as a callable tool.  The LLM calls it
-when the user explicitly asks to remember, save, or note something.  The allowed
-memory types are enforced via a ``Literal`` type annotation so the Strands framework
-includes them in the JSON schema sent to the model, providing sampler-level
-validation without relying on system-prompt rules.
-
-See ``src/agents/memorize.py`` for the ``MemorizeSubAgent`` class — a retained
-sub-agent designed for the future ``PostTurnMemoryHook`` auto-memory pattern
-(not active today).
-
-Usage:
-    from src.tools.memorize import create_memorize_tool
-    memorize_tool = create_memorize_tool(memory_manager)
-    agent = Agent(model=..., tools=[memorize_tool], system_prompt=...)
+V1.1: Uses ``MemoryProvider.save()`` instead of ``MemoryManager.save_message()``
+and returns the common ``ToolResult`` envelope so downstream code can read
+success / error uniformly across tools.
 """
 
-from datetime import datetime, timezone
 from typing import Literal, Optional
-from uuid import uuid4
 
 from strands import tool
 
-from src.constants import MEMORY_ID_HEX_LENGTH, MEMORY_TIMESTAMP_DISPLAY_FORMAT, VALID_MEMORY_TYPES
+from src.constants import VALID_MEMORY_TYPES
 from src.logging_config import get_logger
-from src.memory.manager import MemoryManager
+from src.memory.provider import MemoryProvider
+from src.tools.envelope import ToolResult, err, ok
 
 logger = get_logger(__name__)
 
 
-def create_memorize_tool(memory_manager: MemoryManager, session_id: Optional[str] = None):
+def create_memorize_tool(memory_provider: MemoryProvider, session_id: Optional[str] = None):
     """
     Create a Strands @tool that saves content to long-term memory.
 
     Args:
-        memory_manager: The MemoryManager instance to write through.
-        session_id: Current session ID. When provided, episodic entries are
-            stored under conversations/{session_id}/ instead of unknown_session/.
+        memory_provider: The MemoryProvider instance to write through.
+        session_id: Current session ID (used as topic for episodic entries).
 
     Returns:
         A Strands tool function decorated with @tool.
@@ -51,7 +35,7 @@ def create_memorize_tool(memory_manager: MemoryManager, session_id: Optional[str
         content: str,
         type: Literal["episodic", "semantic", "procedural"],
         topic: str = "",
-    ) -> str:
+    ) -> ToolResult:
         """
         Save information to long-term memory. Call this only when the user
         explicitly asks to remember, save, or note something.
@@ -62,7 +46,8 @@ def create_memorize_tool(memory_manager: MemoryManager, session_id: Optional[str
             topic: Optional category label (e.g. 'work', 'preferences').
 
         Returns:
-            Confirmation string or an error message.
+            ``ToolResult`` envelope. On success ``data`` carries the saved key;
+            on failure ``error`` carries a human-readable message.
         """
         logger.debug(
             "memorize: called",
@@ -71,9 +56,8 @@ def create_memorize_tool(memory_manager: MemoryManager, session_id: Optional[str
 
         if not content.strip():
             logger.warning("memorize: rejected — empty content")
-            return "Error: content cannot be empty."
+            return err("content cannot be empty")
 
-        # Normalize type casing silently (e.g. "Episodic" → "episodic")
         type = type.casefold()
 
         if type not in VALID_MEMORY_TYPES:
@@ -81,35 +65,28 @@ def create_memorize_tool(memory_manager: MemoryManager, session_id: Optional[str
                 "memorize: rejected — invalid type",
                 extra={"data": {"type": type}},
             )
-            return f"Error: type must be one of {sorted(VALID_MEMORY_TYPES)}."
+            return err(f"type must be one of {sorted(VALID_MEMORY_TYPES)}")
 
-        now = datetime.now(timezone.utc)
-        timestamp_iso = now.isoformat()
-        enriched_content = f"[{now.strftime(MEMORY_TIMESTAMP_DISPLAY_FORMAT)}] {content.strip()}"
-
-        message_id = f"{type}_{uuid4().hex[:MEMORY_ID_HEX_LENGTH]}"
-        metadata: dict = {
-            "type": type,
-            "topic": topic.strip() or None,
-            "timestamp": timestamp_iso,
-        }
-        # Episodic entries are scoped to the current session so they land in the
-        # right folder (conversations/{session_id}/…) rather than unknown_session/.
-        if type == "episodic" and session_id is not None:
-            metadata["session_id"] = session_id
+        resolved_topic = topic.strip() or None
+        if type == "episodic" and session_id is not None and not resolved_topic:
+            resolved_topic = session_id
 
         try:
-            memory_manager.save_message(message_id, enriched_content, metadata)
+            item = memory_provider.save(
+                content.strip(),
+                type=type,
+                topic=resolved_topic,
+            )
             logger.debug(
                 "memorize: saved",
-                extra={"data": {"message_id": message_id, "type": type}},
+                extra={"data": {"key": item.key, "type": type}},
             )
-            return f"Saved to memory with key: {message_id}"
+            return ok({"key": item.key}, type=type, topic=resolved_topic)
         except Exception as exc:
             logger.error(
                 "memorize: save failed",
-                extra={"data": {"message_id": message_id, "error": str(exc)}},
+                extra={"data": {"error": str(exc)}},
             )
-            return f"Error saving to memory: {str(exc)}"
+            return err(f"save failed: {exc}")
 
     return memorize

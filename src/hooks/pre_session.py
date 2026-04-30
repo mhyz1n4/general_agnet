@@ -1,23 +1,17 @@
 """
 Pre-session hook — validates system prerequisites before starting a chat session.
 
-Checks (in order):
-  1. Memory root is writable (abort on failure).
-  2. Redis connectivity (degrade on failure).
-  3. LLM API key is valid via a lightweight ping (abort on AuthenticationError,
+V1.2 checks (in order):
+  1. Memory root is writable and ReMeLight directory structure exists (abort on
+     failure).  Creates ``memory/``, ``MEMORY.md``, and ``memory.md`` if missing.
+  2. LLM API key is valid via a lightweight ping (abort on AuthenticationError,
      degrade on RateLimitError).
-  4. Log rotation (delete oldest log files if logs/ exceeds 500MB).
-
-Returns a HookResult with degraded=True if the session can continue in a
-reduced-capability mode (no Redis), or success=False if it must abort.
+  3. Log rotation (delete oldest log files if logs/ exceeds 500MB).
 """
 
-import logging
 import os
 import shutil
 from typing import Optional
-
-import redis as redis_lib
 
 from src.client.base import LLMClient
 from src.constants import (
@@ -40,18 +34,26 @@ class PreSessionHook(BaseHook):
     def __init__(
         self,
         memory_root: str,
-        redis_client: Optional[redis_lib.Redis] = None,
         llm_client: Optional[LLMClient] = None,
         llm_model: str = DEFAULT_AGENT_MODEL,
         log_dir: str = "./logs",
     ) -> None:
+        """
+        Initialise the pre-session hook.
+
+        Args:
+            memory_root: Path to the memory root directory.
+            llm_client:  Optional LLM client for API key validation.
+            llm_model:   Model identifier for the LLM ping call.
+            log_dir:     Path to the log directory for rotation.
+        """
         self.memory_root = memory_root
-        self.redis_client = redis_client
         self.llm_client = llm_client
         self.llm_model = llm_model
         self.log_dir = log_dir
 
     def run(self, **kwargs: object) -> HookResult:
+        """Execute all pre-session health checks."""
         logger.debug("pre_session: starting health checks")
         issues: list[str] = []
         degraded = False
@@ -64,13 +66,7 @@ class PreSessionHook(BaseHook):
                 message="Memory root is not writable. Cannot start session.",
             )
 
-        # 2. Redis check
-        redis_ok = self._check_redis()
-        if not redis_ok:
-            degraded = True
-            issues.append("Redis unavailable — session memory disabled")
-
-        # 3. LLM check
+        # 2. LLM check
         llm_result = self._check_llm()
         if llm_result == "auth_error":
             return HookResult(
@@ -81,7 +77,7 @@ class PreSessionHook(BaseHook):
             degraded = True
             issues.append("LLM rate-limited at startup — may affect first response")
 
-        # 4. Log rotation
+        # 3. Log rotation
         self._rotate_logs()
 
         msg = "Session ready"
@@ -94,16 +90,13 @@ class PreSessionHook(BaseHook):
         )
         return HookResult(success=True, message=msg, degraded=degraded)
 
-    # ------------------------------------------------------------------
-    # Internal checks
-    # ------------------------------------------------------------------
-
     def _check_filesystem(self) -> bool:
         """
-        Verify that the memory root directory is writable.
+        Verify that the memory root is writable and ReMeLight directories exist.
 
-        Creates the directory if it does not exist, then performs a
-        write-and-delete test to confirm the filesystem is not read-only.
+        Creates the memory root, the ``memory/`` subdirectory (where ``.md``
+        entries are stored and watched), and the ``MEMORY.md`` / ``memory.md``
+        index files if they are missing.
 
         Returns:
             ``True`` if the directory is writable; ``False`` otherwise.
@@ -114,6 +107,21 @@ class PreSessionHook(BaseHook):
             with open(test_path, "w") as f:
                 f.write(WRITE_TEST_CONTENT)
             os.unlink(test_path)
+
+            # ReMeLight file watcher expects these paths to exist on startup.
+            memory_subdir = os.path.join(self.memory_root, "memory")
+            os.makedirs(memory_subdir, exist_ok=True)
+
+            for index_file in ("MEMORY.md", "memory.md"):
+                path = os.path.join(self.memory_root, index_file)
+                if not os.path.exists(path):
+                    with open(path, "w", encoding="utf-8") as f:
+                        pass  # empty file — placeholder for file watcher
+                    logger.debug(
+                        "pre_session: created missing index file",
+                        extra={"data": {"path": path}},
+                    )
+
             logger.debug("pre_session: filesystem check passed")
             return True
         except OSError as exc:
@@ -123,37 +131,9 @@ class PreSessionHook(BaseHook):
             )
             return False
 
-    def _check_redis(self) -> bool:
-        """
-        Ping Redis to verify connectivity.
-
-        If no ``redis_client`` is configured, Redis is treated as absent
-        rather than failed — the method returns ``True`` immediately.
-
-        Returns:
-            ``True`` if Redis is reachable or not configured; ``False`` on
-            any connection or command error.
-        """
-        if self.redis_client is None:
-            return True  # Redis not configured — not a failure
-        try:
-            self.redis_client.ping()
-            logger.debug("pre_session: Redis check passed")
-            return True
-        except Exception as exc:
-            logger.warning(
-                "pre_session: Redis unavailable",
-                extra={"data": {"error": str(exc), "alert": True}},
-            )
-            return False
-
     def _check_llm(self) -> str:
         """
         Perform a lightweight LLM API ping to validate the API key.
-
-        If no ``llm_client`` is configured the check is skipped and ``'ok'``
-        is returned.  Exception classification is based on the exception
-        class name so it works across different provider SDKs.
 
         Returns:
             ``'ok'``         — API key is valid (or no client configured).
@@ -164,7 +144,6 @@ class PreSessionHook(BaseHook):
         if self.llm_client is None:
             return "ok"
         try:
-            # Lightweight ping — one token completion
             self.llm_client.completion(
                 messages=[{"role": "user", "content": "ping"}],
                 model=self.llm_model,
@@ -196,19 +175,13 @@ class PreSessionHook(BaseHook):
         """
         Evict old log entries when the log directory exceeds the size cap.
 
-        Scans ``self.log_dir`` for:
-          - Session subdirectories (``session_*``) — deleted as a whole unit
-            to preserve per-session log integrity.
-          - Legacy root-level files — deleted individually (backward compat).
-
         Entries are sorted by modification time (oldest first) and removed
-        until the total size is at or below ``LOG_DIR_MAX_BYTES``.  Errors
-        are logged at WARNING and do not abort the session.
+        until the total size is at or below ``LOG_DIR_MAX_BYTES``.
         """
         if not os.path.isdir(self.log_dir):
             return
         try:
-            entries: list[tuple[float, str, int, bool]] = []  # (mtime, path, size, is_dir)
+            entries: list[tuple[float, str, int, bool]] = []
             total = 0
 
             for name in os.listdir(self.log_dir):
@@ -229,7 +202,7 @@ class PreSessionHook(BaseHook):
             if total <= LOG_DIR_MAX_BYTES:
                 return
 
-            entries.sort()  # oldest first
+            entries.sort()
             for _, path, size, is_dir in entries:
                 if total <= LOG_DIR_MAX_BYTES:
                     break

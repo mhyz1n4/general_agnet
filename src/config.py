@@ -1,7 +1,7 @@
 """
 Application configuration.
 
-Priority (highest → lowest):
+Priority (highest -> lowest):
   1. Explicit init values
   2. Environment variables / .env file
   3. config/v1/app.yaml  (default values, version-controlled)
@@ -9,40 +9,36 @@ Priority (highest → lowest):
 Secrets (e.g. llm_api_key) must be supplied via environment variable or .env.
 They are intentionally absent from the YAML file.
 
-The YAML is structured hierarchically for readability.  The YamlSettingsSource
-flattens it into the same flat namespace used by the pydantic model fields:
-
-    llm.model        → llm_model
-    redis.host       → redis_host
-    session.tool_timeout_seconds → session_tool_timeout_seconds  (*)
-
-(*) Collision guard: if a flattened key doesn't match any model field it is
-    silently ignored, so adding new YAML sections never breaks existing code.
+The YAML uses flat keys that match Config field names exactly (see
+config/v1/app.yaml). Unknown keys in the YAML are silently ignored, so
+adding new sections to the file never breaks running code.
 """
 
 import os
-from typing import Dict, Tuple, Type, Union
+from typing import Dict, Optional, Tuple, Type, Union
 
 import yaml
+from pydantic import Field
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from src.constants import (
-    DEFAULT_DLQ_MAX_ATTEMPTS,
-    DEFAULT_DLQ_PATH,
-    DEFAULT_DLQ_RETRY_INTERVAL,
+    DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+    DEFAULT_COMPACT_BATCH_SIZE,
     DEFAULT_LLM_MAX_TOKENS,
     DEFAULT_LOG_DIR,
     DEFAULT_LOG_LEVEL,
+    DEFAULT_MAX_CONVERSATION_MESSAGES,
     DEFAULT_MAX_TOOL_CALLS,
     DEFAULT_STRANDS_LOG_LEVEL,
     DEFAULT_MAX_CONTEXT_CHARS,
     DEFAULT_SESSION_INACTIVITY_TIMEOUT,
-    DEFAULT_SESSION_MAX_MESSAGES,
-    DEFAULT_TOOL_TIMEOUT_SECONDS,
-    REDIS_DEFAULT_HOST,
-    REDIS_DEFAULT_PORT,
-    REDIS_DEFAULT_TTL,
+    DEFAULT_SUB_AGENT_MAX_TOOL_CALLS,
+    DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
+    DEFAULT_TAVILY_ENDPOINT,
+    DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH,
+    DEFAULT_TOOL_BUDGET_RUN_PYTHON,
+    DEFAULT_TOOL_BUDGET_WEB_SEARCH,
     VLLM_API_KEY,
     VLLM_BASE_URL,
     VLLM_MODEL_ID,
@@ -121,7 +117,7 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
         are not accidentally shadowed by a ``None`` from an absent YAML key.
 
         Returns:
-            Dict of field-name → scalar value for all present YAML keys.
+            Dict of field-name -> scalar value for all present YAML keys.
         """
         # Only emit keys that are present and non-None so that pydantic
         # model defaults are not accidentally overwritten with None.
@@ -132,7 +128,7 @@ class Config(BaseSettings):
     """
     Validated application configuration.
 
-    Sources (highest → lowest priority):
+    Sources (highest -> lowest priority):
       init args > env vars > .env file > config/v1/app.yaml > field defaults
     """
 
@@ -142,33 +138,64 @@ class Config(BaseSettings):
     llm_api_endpoint: str = VLLM_BASE_URL
     llm_max_tokens: int = DEFAULT_LLM_MAX_TOKENS
 
-    # Memory (file system)
+    # Memory (ReMeLight working directory)
     memory_root: str
-    index_path: str
-
-    # Redis (short-term session memory)
-    redis_host: str = REDIS_DEFAULT_HOST
-    redis_port: int = REDIS_DEFAULT_PORT
-    redis_ttl: int = REDIS_DEFAULT_TTL
-    session_max_messages: int = DEFAULT_SESSION_MAX_MESSAGES
 
     # Session behaviour
     session_inactivity_timeout_seconds: int = DEFAULT_SESSION_INACTIVITY_TIMEOUT
-    tool_timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS
+    # Wall-clock cap on a single agent.__call__ — the full LLM ↔ tool loop
+    # for one user turn.  Per-tool HTTP/subprocess timeouts are constants
+    # inside the tool modules themselves, not knobs.
+    agent_turn_timeout_seconds: int = DEFAULT_AGENT_TURN_TIMEOUT_SECONDS
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS
+
+    # Conversation compaction
+    max_conversation_messages: int = DEFAULT_MAX_CONVERSATION_MESSAGES
+    compact_batch_size: int = DEFAULT_COMPACT_BATCH_SIZE
 
     # Logging — base directory; session subfolder is computed at runtime
     log_dir: str = DEFAULT_LOG_DIR
     log_level: str = DEFAULT_LOG_LEVEL
     strands_log_level: str = DEFAULT_STRANDS_LOG_LEVEL
 
-    # Dead-letter queue
-    dlq_path: str = DEFAULT_DLQ_PATH
-    dlq_max_attempts: int = DEFAULT_DLQ_MAX_ATTEMPTS
-    dlq_retry_interval_seconds: int = DEFAULT_DLQ_RETRY_INTERVAL
+    # External tools — Tavily web search.  Token is read from the
+    # ``TAVILY_SEARCH_TOKEN`` env var by default; tool unregisters when the
+    # token is unset so the agent never sees a broken web_search.
+    tavily_search_token: Optional[str] = Field(
+        default_factory=lambda: os.environ.get("TAVILY_SEARCH_TOKEN")
+    )
+    tavily_search_endpoint: str = DEFAULT_TAVILY_ENDPOINT
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # Risky-action confirmation.  ``auto`` picks interactive when stdin is
+    # a TTY, otherwise non_interactive (which denies by default).
+    tool_confirmation_mode: str = "auto"
+
+    # Python code execution.  Default OFF — the sandbox is subprocess+rlimit,
+    # which is NOT a security boundary.  Operators who enable this in any
+    # deployment with an untrusted prompt path accept arbitrary-code-execution
+    # risk.  Subprocess timeouts and rlimits are constants inside
+    # ``src/tools/run_python.py`` — not knobs.
+    enable_code_exec: bool = False
+
+    # Per-tool budgets — each is a per-turn cap.  ``max_tool_calls`` still
+    # bounds the total; these provide tighter limits for specific tools.
+    tool_budget_web_search: int = DEFAULT_TOOL_BUDGET_WEB_SEARCH
+    tool_budget_run_python: int = DEFAULT_TOOL_BUDGET_RUN_PYTHON
+    tool_budget_delegate_to_research: int = DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH
+
+    # Research sub-agent — bounds the sub-agent's own per-delegation
+    # tool-call count and wall-clock runtime.  Kept independent from the
+    # parent's ``max_tool_calls`` so a stuck sub-agent can't starve the
+    # main loop.
+    sub_agent_max_tool_calls: int = DEFAULT_SUB_AGENT_MAX_TOOL_CALLS
+    sub_agent_timeout_seconds: int = DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     @classmethod
     def settings_customise_sources(  # type: ignore[override]

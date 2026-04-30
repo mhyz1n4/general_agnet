@@ -1,0 +1,72 @@
+# Golden eval fixtures for the V1.1 M0 harness.
+#
+# Each fixture runs through the live orchestrator against a real LLM.  The
+# harness fails a fixture when any of the assertions below do not hold:
+#
+#   expected_substrings  (required) — every entry must appear in the final
+#                                     assistant response, case-insensitive.
+#   max_latency_ms       (optional) — upper bound on the per-turn wall-clock
+#                                     latency (including LLM).  Omit to skip.
+#   max_tool_calls       (optional) — upper bound on total tool calls across
+#                                     all turns in the fixture.  Omit to skip.
+#   seed_memory          (optional) — list of {content, type, topic} dicts
+#                                     inserted into the provider before the
+#                                     first turn runs.  Used for memory-hit
+#                                     fixtures.
+#   turns                (required) — list of user messages. Multi-turn
+#                                     fixtures share one orchestrator / agent
+#                                     across turns; assertions apply to the
+#                                     final assistant response.
+#
+# Scope: substring matching catches gross regressions for V1.1.  LLM-as-judge
+# scoring is a V2 upgrade (see design_v1_1.md).
+
+fixtures:
+  # --- Memory-hit: agent recalls a preseeded user preference --------------
+  - name: memory_hit_preference
+    seed_memory:
+      - content: "The user's favourite programming language is Rust."
+        type: semantic
+        topic: preferences
+    turns:
+      - "What is my favourite programming language?"
+    expected_substrings: ["rust"]
+    max_latency_ms: 30000
+    max_tool_calls: 2
+
+  # --- Memory-hit: agent recalls a preseeded procedural note --------------
+  - name: memory_hit_procedure
+    seed_memory:
+      - content: "To deploy the service, run `make deploy-prod` after merging to main."
+        type: procedural
+        topic: deployment
+    turns:
+      - "How do I deploy the service to production?"
+    expected_substrings: ["make deploy-prod"]
+    max_latency_ms: 30000
+    max_tool_calls: 2
+
+  # --- Memory-miss: arithmetic — must answer from base knowledge ----------
+  - name: memory_miss_arithmetic
+    turns:
+      - "What is 17 times 23? Respond with just the number."
+    expected_substrings: ["391"]
+    max_latency_ms: 30000
+    max_tool_calls: 1
+
+  # --- Memory-miss: general knowledge, no retrieval available ------------
+  - name: memory_miss_general_knowledge
+    turns:
+      - "What is the capital of France? Respond with just the city name."
+    expected_substrings: ["paris"]
+    max_latency_ms: 30000
+    max_tool_calls: 1
+
+  # --- Multi-turn refinement: second turn narrows the first --------------
+  - name: multi_turn_refinement
+    turns:
+      - "Name three programming languages in common use today."
+      - "Of those three, which one is most commonly used for systems programming?"
+    expected_substrings: ["rust"]
+    max_latency_ms: 60000
+    max_tool_calls: 2

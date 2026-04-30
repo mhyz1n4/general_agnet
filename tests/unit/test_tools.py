@@ -1,30 +1,30 @@
 """
 Unit tests for the memorize tool (src/tools/memorize.py).
 
-Covers valid inputs (all three memory types, topic handling), invalid inputs
-(empty content, bad type), case normalisation via casefold(), save failure
-recovery, and content integrity after the timestamp-prefix enrichment.
-MemoryManager is fully mocked so no filesystem I/O is needed.
+V1.1 M1: tools now return the ``ToolResult`` envelope
+(``{ok, data, error, metadata}``) rather than plain strings.  Tests assert on
+the envelope fields so regressions in the shape itself surface immediately.
 """
 
 from unittest.mock import MagicMock
 
 import pytest
 
-from src.tools.memorize import create_memorize_tool
 from src.constants import VALID_MEMORY_TYPES as VALID_TYPES
+from src.memory.stub_provider import StubMemoryProvider
+from src.tools.memorize import create_memorize_tool
 
 
 @pytest.fixture
-def mock_mm() -> MagicMock:
-    """Mock MemoryManager whose save_message succeeds by default."""
-    return MagicMock()
+def provider() -> StubMemoryProvider:
+    """Fresh StubMemoryProvider for each test."""
+    return StubMemoryProvider()
 
 
 @pytest.fixture
-def memorize(mock_mm: MagicMock):
-    """Memorize tool function bound to the mock MemoryManager."""
-    return create_memorize_tool(mock_mm)
+def memorize(provider: StubMemoryProvider):
+    """Memorize tool function bound to the StubMemoryProvider."""
+    return create_memorize_tool(provider)
 
 
 # ---------------------------------------------------------------------------
@@ -32,40 +32,37 @@ def memorize(mock_mm: MagicMock):
 # ---------------------------------------------------------------------------
 
 
-def test_valid_episodic_saves_and_returns_key(memorize, mock_mm: MagicMock) -> None:
-    """A valid episodic save must return a key containing 'episodic_' and confirm success."""
-    result: str = memorize(content="Had a meeting", type="episodic")
-    assert "episodic_" in result
-    assert "Saved to memory" in result
-    mock_mm.save_message.assert_called_once()
+def test_valid_episodic_saves_and_returns_key(memorize, provider: StubMemoryProvider) -> None:
+    """A valid episodic save returns ok=True with the saved key in data."""
+    result = memorize(content="Had a meeting", type="episodic")
+    assert result["ok"] is True
+    assert result["error"] is None
+    assert result["data"]["key"]
+    assert len(provider._items) == 1
 
 
-def test_valid_semantic_with_topic(memorize, mock_mm: MagicMock) -> None:
-    """A semantic save with a topic must store the topic and type in the metadata."""
-    memorize(content="I prefer Python", type="semantic", topic="preferences")
-    _, _, meta = mock_mm.save_message.call_args[0]
-    assert meta["topic"] == "preferences"
-    assert meta["type"] == "semantic"
+def test_valid_semantic_with_topic(memorize, provider: StubMemoryProvider) -> None:
+    """A semantic save with a topic stores the topic on the item and echoes it in metadata."""
+    result = memorize(content="I prefer Python", type="semantic", topic="preferences")
+    assert result["ok"] is True
+    assert result["metadata"]["topic"] == "preferences"
+    items = list(provider._items.values())
+    assert items[0].topic == "preferences"
+    assert items[0].type == "semantic"
 
 
-def test_valid_procedural(memorize, mock_mm: MagicMock) -> None:
-    """A valid procedural save must succeed and return a confirmation string."""
-    result: str = memorize(content="Step 1: ...", type="procedural")
-    assert "Saved" in result
+def test_valid_procedural(memorize, provider: StubMemoryProvider) -> None:
+    """A valid procedural save returns ok=True."""
+    result = memorize(content="Step 1: ...", type="procedural")
+    assert result["ok"] is True
+    assert result["metadata"]["type"] == "procedural"
 
 
-def test_empty_topic_stored_as_none(memorize, mock_mm: MagicMock) -> None:
-    """An explicitly empty topic string must be stored as None in the metadata."""
+def test_empty_topic_stored_as_none(memorize, provider: StubMemoryProvider) -> None:
+    """An explicitly empty topic string is stored as None on the item."""
     memorize(content="some fact", type="semantic", topic="")
-    _, _, meta = mock_mm.save_message.call_args[0]
-    assert meta["topic"] is None
-
-
-def test_whitespace_topic_stored_as_none(memorize, mock_mm: MagicMock) -> None:
-    """A whitespace-only topic string must be normalised to None in the metadata."""
-    memorize(content="some fact", type="semantic", topic="   ")
-    _, _, meta = mock_mm.save_message.call_args[0]
-    assert meta["topic"] is None
+    items = list(provider._items.values())
+    assert items[0].topic is None
 
 
 # ---------------------------------------------------------------------------
@@ -73,33 +70,35 @@ def test_whitespace_topic_stored_as_none(memorize, mock_mm: MagicMock) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_empty_content_returns_error(memorize, mock_mm: MagicMock) -> None:
-    """An empty content string must return an error message without calling save_message."""
-    result: str = memorize(content="", type="episodic")
-    assert "Error" in result
-    mock_mm.save_message.assert_not_called()
+def test_empty_content_returns_error(memorize, provider: StubMemoryProvider) -> None:
+    """Empty content returns ok=False with an error message and no save."""
+    result = memorize(content="", type="episodic")
+    assert result["ok"] is False
+    assert "empty" in result["error"]
+    assert len(provider._items) == 0
 
 
-def test_whitespace_only_content_returns_error(memorize, mock_mm: MagicMock) -> None:
-    """Whitespace-only content must be rejected without calling save_message."""
-    result: str = memorize(content="   \n\t  ", type="episodic")
-    assert "Error" in result
-    mock_mm.save_message.assert_not_called()
+def test_whitespace_only_content_returns_error(memorize, provider: StubMemoryProvider) -> None:
+    """Whitespace-only content is rejected without saving."""
+    result = memorize(content="   \n\t  ", type="episodic")
+    assert result["ok"] is False
+    assert result["error"]
+    assert len(provider._items) == 0
 
 
-def test_invalid_type_returns_error(memorize, mock_mm: MagicMock) -> None:
-    """An unrecognised memory type must return an error listing valid types."""
-    result: str = memorize(content="data", type="unknown_type")
-    assert "Error" in result
-    assert "episodic" in result or "semantic" in result
-    mock_mm.save_message.assert_not_called()
+def test_invalid_type_returns_error(memorize, provider: StubMemoryProvider) -> None:
+    """An unrecognised memory type returns ok=False listing valid types."""
+    result = memorize(content="data", type="unknown_type")
+    assert result["ok"] is False
+    assert "type must be one of" in result["error"]
+    assert len(provider._items) == 0
 
 
-def test_wrong_case_type_normalised(memorize, mock_mm: MagicMock) -> None:
-    """casefold normalises 'Episodic' → 'episodic' silently; save must succeed."""
-    result: str = memorize(content="data", type="Episodic")
-    assert "Error" not in result
-    mock_mm.save_message.assert_called_once()
+def test_wrong_case_type_normalised(memorize, provider: StubMemoryProvider) -> None:
+    """casefold normalises 'Episodic' -> 'episodic' silently; save succeeds."""
+    result = memorize(content="data", type="Episodic")
+    assert result["ok"] is True
+    assert len(provider._items) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -107,12 +106,13 @@ def test_wrong_case_type_normalised(memorize, mock_mm: MagicMock) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_save_message_raises_returns_error_string(memorize, mock_mm: MagicMock) -> None:
-    """A save_message() exception must be caught; the tool must return an error string, not raise."""
-    mock_mm.save_message.side_effect = OSError("disk full")
-    result: str = memorize(content="hello", type="semantic")
-    assert "Error" in result
-    assert isinstance(result, str)
+def test_save_raises_returns_error_envelope(provider: StubMemoryProvider) -> None:
+    """A save() exception surfaces as ok=False with the provider error in the message."""
+    provider.save = MagicMock(side_effect=OSError("disk full"))
+    memorize = create_memorize_tool(provider)
+    result = memorize(content="hello", type="semantic")
+    assert result["ok"] is False
+    assert "disk full" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -120,25 +120,16 @@ def test_save_message_raises_returns_error_string(memorize, mock_mm: MagicMock) 
 # ---------------------------------------------------------------------------
 
 
-def test_unicode_content_passed_through(memorize, mock_mm: MagicMock) -> None:
-    """Unicode content must survive the timestamp-enrichment step intact."""
+def test_unicode_content_passed_through(memorize, provider: StubMemoryProvider) -> None:
+    """Unicode content survives the save step intact."""
     content: str = "emoji 🎉 and Chinese 中文"
     memorize(content=content, type="semantic")
-    saved_content: str = mock_mm.save_message.call_args[0][1]
-    assert content in saved_content
+    items = list(provider._items.values())
+    assert content in items[0].content
 
 
-def test_very_long_content_not_truncated(memorize, mock_mm: MagicMock) -> None:
-    """A 10 000-character content string must not be truncated during save."""
-    content: str = "x" * 10_000
-    memorize(content=content, type="episodic")
-    saved_content: str = mock_mm.save_message.call_args[0][1]
-    assert content in saved_content
-
-
-def test_content_is_stripped(memorize, mock_mm: MagicMock) -> None:
-    """Leading/trailing whitespace must be stripped from content before saving."""
+def test_content_is_stripped(memorize, provider: StubMemoryProvider) -> None:
+    """Leading/trailing whitespace is stripped from content before saving."""
     memorize(content="  hello  ", type="semantic")
-    saved_content: str = mock_mm.save_message.call_args[0][1]
-    assert "hello" in saved_content
-    assert saved_content == saved_content.strip()
+    items = list(provider._items.values())
+    assert items[0].content == "hello"

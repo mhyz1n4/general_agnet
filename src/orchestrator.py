@@ -1,53 +1,57 @@
 """
 Chat session orchestrator.
 
-Per-turn flow:
-  pre_mem_fetch hook → get_context_with_keys → post_mem_fetch hook
-  → render context_prefix.j2 → agent(prefix + user_input)
-  → save turn to memory → update metrics
+Per-turn flow (V1.1):
+  inline normalize query -> memory_provider.search() -> render context
+  (trimming low-relevance items to fit max_context_chars)
+  -> agent(prefix + user_input) -> memory_provider.save() -> update metrics
 
 Design features:
   - Tool timeout: every agent call is wrapped with TOOL_TIMEOUT_SECONDS.
-  - Error recovery (§5c): tracks consecutive turn failures; after two in a row
+  - Error recovery (SS5c): tracks consecutive turn failures; after two in a row
     returns a graceful degraded message and resets the counter.
-  - Context budget (§5b): logs a critical alert when injected context approaches
+  - Context budget (SS5b): logs a critical alert when injected context approaches
     the configured character limit.  Strands manages its own history so we cannot
     truncate it directly, but the alert signals operator intervention.
-  - Enhanced metrics: duration, token estimate, latency, turn count, hit/miss,
-    eviction count, index/storage sizes.
+  - Enhanced metrics: duration, token estimate, latency, turn count, hit/miss.
 """
 
 import concurrent.futures
 import contextvars
+import json
 import os
 import re
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, List, Optional
 
 from rich.console import Console
 from rich.markdown import Markdown
 
+from src.agents.context import AgentStateContext
 from src.config import Config
 from src.constants import (
+    ARCHIVE_DIR_NAME,
+    ARCHIVE_SESSION_FILENAME_FORMAT,
     CHARS_PER_TOKEN,
     CONSECUTIVE_FAILURES_BEFORE_GRACEFUL,
     CONTEXT_BUDGET_ALERT_THRESHOLD,
-    DEFAULT_MAX_TOOL_CALLS,
     DEFAULT_RETRIEVAL_LIMIT,
+    DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH,
+    DEFAULT_TOOL_BUDGET_RUN_PYTHON,
+    DEFAULT_TOOL_BUDGET_WEB_SEARCH,
     EXIT_COMMANDS,
     MEMORY_TIMESTAMP_DISPLAY_FORMAT,
-    MEMORY_TYPE_EPISODIC,
+    METRICS_FLUSH_INTERVAL_TURNS,
+    TURN_SUMMARY_MAX_CHARS,
 )
-from src.hooks.post_mem_fetch import PostMemFetchHook
 from src.hooks.post_session import PostSessionHook
-from src.hooks.pre_mem_fetch import PreMemFetchHook
-from src.logging_config import get_logger, set_trace_id
-from src.memory.manager import MemoryManager
+from src.logging_config import get_logger, get_trace_id, set_trace_id
+from src.memory.provider import MemoryItem, MemoryProvider, SearchFilters
 from src.memory.types import SessionMetricsDict, TurnRecord
 from src.prompts.loader import render_prompt
+from src.tools.cache import SessionToolCache, set_session_cache
 
 logger = get_logger(__name__)
 
@@ -56,22 +60,90 @@ _GRACEFUL_ERROR = (
     "Please try again or rephrase your message."
 )
 
-# Thread-local state used by the Strands #815 workaround patch in main.py.
-# Each agent invocation (which runs in its own executor thread) initialises
-# these before calling the agent so the patch can enforce a per-invocation
-# tool-call retry limit without shared mutable global state.
-tool_call_counter = threading.local()  # attrs: count (int), limit (int)
 
-# Matches <think>…</think> and <thinking>…</thinking> emitted by CoT/reasoning
-# models (e.g. DeepSeek-R1, QwQ, o1-style open-weights).  The block is always
-# stripped before the response reaches the user or memory — we never want raw
-# chain-of-thought in either place.
-_THINKING_TAG_RE = re.compile(r"<think(?:ing)?>\s*.*?\s*</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+_THINKING_TAG_RE = re.compile(r"<think(?:ing)?>\s*(.*?)\s*</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+
+_QUERY_NORMALIZE_RE = re.compile(r"[^a-zA-Z0-9\s']")
+_WHITESPACE_COLLAPSE_RE = re.compile(r"\s+")
+
+
+def _split_thinking(text: str) -> tuple[str, str]:
+    """
+    Separate chain-of-thought blocks from the user-visible response.
+
+    The model may emit one or more ``<think>...</think>`` (or ``<thinking>``)
+    spans; we surface them in logs and on the console for transparency, but
+    strip them from whatever is persisted to memory so the CoT trace does
+    not pollute long-term storage.
+
+    Returns:
+        ``(thinking, visible)`` — ``thinking`` concatenates all CoT spans
+        separated by blank lines (empty string if none); ``visible`` is the
+        cleaned response with CoT spans removed.
+    """
+    thoughts = [m.strip() for m in _THINKING_TAG_RE.findall(text) if m.strip()]
+    visible = _THINKING_TAG_RE.sub("", text).strip()
+    return "\n\n".join(thoughts), visible
 
 
 def _strip_thinking(text: str) -> str:
-    """Remove CoT thinking blocks from *text* and return the cleaned string."""
-    return _THINKING_TAG_RE.sub("", text).strip()
+    """Backwards-compatible helper that returns only the visible portion."""
+    return _split_thinking(text)[1]
+
+
+def _normalize_query(query: str) -> str:
+    """Normalize a user query for memory search: strip punctuation, lowercase, collapse whitespace."""
+    cleaned = _QUERY_NORMALIZE_RE.sub("", query)
+    cleaned = cleaned.lower()
+    return _WHITESPACE_COLLAPSE_RE.sub(" ", cleaned).strip()
+
+
+def _compact_turn_summary(user_input: str, response_text: str, ts_display: str) -> str:
+    """Build a short, retrieval-friendly summary of one turn.
+
+    Caps both halves at ``TURN_SUMMARY_MAX_CHARS`` so a noisy turn cannot
+    bloat the episodic store; full fidelity lives in the per-session archive.
+    """
+    user_brief = user_input[:TURN_SUMMARY_MAX_CHARS]
+    assistant_brief = response_text[:TURN_SUMMARY_MAX_CHARS]
+    return f"[{ts_display}]\nUser: {user_brief}\nAssistant: {assistant_brief}"
+
+
+def _build_context_input(
+    results: List[MemoryItem],
+    user_input: str,
+    max_chars: int,
+) -> tuple[str, int]:
+    """Render context_prefix + user_input, dropping tail items that exceed budget.
+
+    Items are added in order (assumed most-relevant-first) and dropped from the
+    tail until the rendered ``prefix + user_input`` fits within ``max_chars``.
+
+    Args:
+        results:    Memory items ordered most-relevant-first.
+        user_input: Raw user query (always included verbatim).
+        max_chars:  Hard cap on the returned string length.
+
+    Returns:
+        ``(full_input, dropped_count)`` — the agent input and how many tail
+        items were excluded by the budget.
+    """
+    def _render(items: List[MemoryItem]) -> str:
+        context = "\n\n".join(f"[{r.type}] {r.content}" for r in items) if items else ""
+        prefix = render_prompt("context_prefix", memory_context=context)
+        return f"{prefix}{user_input}" if prefix.strip() else user_input
+
+    kept: List[MemoryItem] = []
+    full_input: Optional[str] = None
+    for item in results:
+        candidate = _render(kept + [item])
+        if len(candidate) > max_chars:
+            break
+        kept.append(item)
+        full_input = candidate
+    if full_input is None:
+        full_input = _render(kept)
+    return full_input, len(results) - len(kept)
 
 
 @dataclass
@@ -82,11 +154,12 @@ class SessionMetrics:
     turn_count: int = 0
     memory_hits: int = 0
     memory_misses: int = 0
-    llm_token_count_est: int = 0    # estimated: (input_chars + output_chars) // CHARS_PER_TOKEN
-    llm_latency_ms: float = 0.0     # wall-clock ms spent inside agent() calls
-    tool_calls_made: int = 0        # tracked externally where Strands exposes it
-    tool_failures: int = 0          # turns where agent() raised an exception
-    eviction_count: int = 0         # Redis→FS evictions (from MemoryManager)
+    llm_token_count_est: int = 0
+    llm_latency_ms: float = 0.0
+    tool_calls_made: int = 0
+    tool_failures: int = 0
+    cache_hits: int = 0
+    cache_read_input_tokens: int = 0
     turns: List[TurnRecord] = field(default_factory=list)
 
     def to_dict(self) -> SessionMetricsDict:
@@ -95,8 +168,6 @@ class SessionMetrics:
 
         Returns:
             A ``SessionMetricsDict`` with all tracked fields populated.
-            ``duration_seconds`` is computed relative to ``start_time`` at
-            the moment of this call.
         """
         return {
             "duration_seconds": round(time.time() - self.start_time, 2),
@@ -107,7 +178,8 @@ class SessionMetrics:
             "llm_latency_ms": round(self.llm_latency_ms, 1),
             "tool_calls_made": self.tool_calls_made,
             "tool_failures": self.tool_failures,
-            "eviction_count": self.eviction_count,
+            "cache_hits": self.cache_hits,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
             "turns": self.turns,
         }
 
@@ -118,9 +190,7 @@ class Orchestrator:
     def __init__(
         self,
         agent: Callable[[str], object],
-        memory_manager: MemoryManager,
-        pre_mem_fetch_hook: PreMemFetchHook,
-        post_mem_fetch_hook: PostMemFetchHook,
+        memory_provider: MemoryProvider,
         post_session_hook: PostSessionHook,
         config: Config,
         session_id: str,
@@ -130,33 +200,17 @@ class Orchestrator:
         Initialise the orchestrator for a single chat session.
 
         Args:
-            agent:               Strands Agent callable.  Accepts a single string
-                                 (the full prompt including injected context) and
-                                 returns the model response as a string or
-                                 string-coercible object.
-            memory_manager:      Manages long-term memory reads and writes.
-                                 ``get_context_with_keys`` is called on every turn;
-                                 ``save_message`` stores the completed turn.
-            pre_mem_fetch_hook:  Runs before ``get_context_with_keys`` to normalise
-                                 the query (e.g. lowercase, strip punctuation).
-            post_mem_fetch_hook: Runs after ``get_context_with_keys`` to truncate
-                                 context exceeding ``config.max_context_chars`` and
-                                 optionally log the retrieval event.
+            agent:               Strands Agent callable.
+            memory_provider:     ``MemoryProvider`` implementation for search,
+                                 save, context management, and session history.
             post_session_hook:   Fired once when the chat loop exits.  Writes
-                                 metrics, generates a session summary, and flushes
-                                 the Redis session store to long-term storage.
-            config:              Validated application settings (timeouts, limits,
-                                 model ID, etc.).
-            session_id:          Unique identifier for this chat session (UUID hex).
-                                 Used in log correlation, file paths, and Redis key
-                                 scoping.
+                                 session metrics.
+            config:              Validated application settings.
+            session_id:          Unique identifier for this chat session.
             console:             Rich Console instance for rendering output.
-                                 Defaults to a fresh ``Console()`` if not provided.
         """
         self.agent = agent
-        self.memory_manager = memory_manager
-        self.pre_mem_fetch_hook = pre_mem_fetch_hook
-        self.post_mem_fetch_hook = post_mem_fetch_hook
+        self.memory_provider = memory_provider
         self.post_session_hook = post_session_hook
         self.config = config
         self.session_id = session_id
@@ -164,6 +218,17 @@ class Orchestrator:
         self.metrics = SessionMetrics()
         self._last_input_time = time.time()
         self._consecutive_failures: int = 0
+        self._tool_cache = SessionToolCache()
+        self._archive_path: Optional[str] = self._resolve_archive_path()
+
+        # Attach an ``AgentStateContext`` if the caller didn't bring one.
+        # ``enforce_tool_budget`` (wired via ``ToolBudgetHookProvider``) reads
+        # this on every ``BeforeToolCallEvent``.
+        if getattr(self.agent, "state_context", None) is None:
+            self.agent.state_context = AgentStateContext(
+                max_tool_calls=getattr(self.config, "max_tool_calls", 0) or 0,
+                per_tool_limits=self._per_tool_budget(),
+            )
 
     def run(self) -> None:
         """Main chat loop."""
@@ -215,6 +280,9 @@ class Orchestrator:
                     )
                     self._consecutive_failures = 0
                     self.console.print(f"\n[red]Assistant:[/red] {_GRACEFUL_ERROR}\n")
+                    # Snapshot metrics so the failure isn't lost if the user
+                    # closes the terminal without typing ``exit``.
+                    self._flush_metrics_snapshot()
                 else:
                     self.console.print(f"[red]Error:[/red] {exc}")
                 continue
@@ -223,68 +291,93 @@ class Orchestrator:
             self.console.print(Markdown(response))
             self.console.print()
 
+            # Periodic snapshot — bounds metric loss to N turns when the
+            # process is killed without a clean exit.
+            if (
+                self.metrics.turn_count > 0
+                and self.metrics.turn_count % METRICS_FLUSH_INTERVAL_TURNS == 0
+            ):
+                self._flush_metrics_snapshot()
+
         self._close_session()
 
     def _process_turn(self, user_input: str) -> str:
         """Execute one full conversation turn and return the assistant response."""
-        # Step 1: pre-mem-fetch — normalise query
-        pre_result = self.pre_mem_fetch_hook.run(user_input)
-        normalised_query = pre_result.message if pre_result.success else user_input
+        normalised_query = _normalize_query(user_input)
 
-        # Step 2: retrieve memory context
-        context, retrieved_keys = self.memory_manager.get_context_with_keys(
-            normalised_query, limit=DEFAULT_RETRIEVAL_LIMIT
+        results = self.memory_provider.search(
+            normalised_query, SearchFilters(limit=DEFAULT_RETRIEVAL_LIMIT)
         )
 
-        if context:
+        if results:
             self.metrics.memory_hits += 1
         else:
             self.metrics.memory_misses += 1
 
-        # Step 3: post-mem-fetch — truncate if needed
-        post_result = self.post_mem_fetch_hook.run(
-            context=context,
-            retrieved_keys=retrieved_keys,
-            query=normalised_query,
+        full_input, dropped = _build_context_input(
+            results, user_input, self.config.max_context_chars
         )
-        context = post_result.message if post_result.success else context
+        if dropped:
+            logger.warning(
+                "orchestrator: dropped memory items to fit context budget",
+                extra={"data": {"dropped": dropped, "kept": len(results) - dropped}},
+            )
 
-        # Step 4: context budget check (§5b)
-        prefix = render_prompt("context_prefix", memory_context=context)
-        full_input = f"{prefix}{user_input}" if prefix.strip() else user_input
+        # Alerts when user_input alone blows past the budget — trimming only covers memory items.
         self._check_context_budget(full_input)
 
-        # Step 5: call agent with timeout
-        response_text = self._call_agent_with_timeout(full_input)
+        raw_response = self._call_agent_with_timeout(full_input)
+        thinking, response_text = _split_thinking(raw_response)
 
-        # Step 6: update token/latency metrics (estimated)
+        # Thinking goes to logs + console only — never to memory.  Logged at
+        # INFO so it lands in ``agent.jsonl`` alongside tool traces.
+        if thinking:
+            logger.info(
+                "orchestrator: model thinking",
+                extra={"data": {"thinking_len": len(thinking), "thinking": thinking}},
+            )
+
         self.metrics.llm_token_count_est += (len(full_input) + len(response_text)) // CHARS_PER_TOKEN
 
-        # Step 7: save turn to memory with timestamp embedded in content so the
-        # LLM can answer temporal questions ("what did I say on Tuesday?").
-        turn_id = f"turn_{self.session_id}_{self.metrics.turn_count}"
+        ts_display = time.strftime(MEMORY_TIMESTAMP_DISPLAY_FORMAT, time.gmtime())
+        tool_names = self.agent.state_context.unique_tools_invoked()
+
+        # Full fidelity goes to the per-session archive; episodic memory
+        # gets a compacted form so retrieval stays cheap.
+        self._append_raw_turn(user_input, response_text, tool_names, ts_display)
+
+        compact_summary = _compact_turn_summary(user_input, response_text, ts_display)
         try:
-            ts_str = time.strftime(MEMORY_TIMESTAMP_DISPLAY_FORMAT, time.gmtime())
-            self.memory_manager.save_message(
-                turn_id,
-                f"[{ts_str}]\nUser: {user_input}\nAssistant: {response_text}",
-                {
-                    "type": MEMORY_TYPE_EPISODIC,
-                    "session_id": self.session_id,
-                    "turn": self.metrics.turn_count,
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                },
+            self.memory_provider.save(
+                compact_summary,
+                type="episodic",
+                topic=self.session_id,
             )
         except Exception as exc:
             logger.warning(
-                "orchestrator: failed to save turn to memory",
-                extra={"data": {"turn_id": turn_id, "error": str(exc)}},
+                "orchestrator: failed to save episodic memory",
+                extra={"data": {"error": str(exc)}},
             )
 
-        # Step 8: update metrics
+        # One topic-tagged entry per unique tool, also compacted.  Tool names
+        # come from the ``enforce_tool_budget`` hook, which appends every
+        # successful call to ``state_context.tools_invoked``.
+        clipped_response = response_text[:TURN_SUMMARY_MAX_CHARS]
+        for tool_name in tool_names:
+            try:
+                self.memory_provider.save(
+                    f"[{ts_display}] tool={tool_name} summary: {clipped_response}",
+                    type="episodic",
+                    topic=tool_name,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "orchestrator: tool-summary write-back failed",
+                    extra={"data": {"tool": tool_name, "error": str(exc)}},
+                )
+
         self.metrics.turn_count += 1
         self.metrics.turns.append({"user": user_input, "assistant": response_text})
-        self.metrics.eviction_count = self.memory_manager.eviction_count
 
         logger.debug(
             "orchestrator: turn complete",
@@ -303,22 +396,27 @@ class Orchestrator:
             extra={"data": {"input_len": len(full_input), "input": full_input}},
         )
 
-        timeout = self.config.tool_timeout_seconds
-        max_calls = self.config.max_tool_calls
+        timeout = self.config.agent_turn_timeout_seconds
         t0 = time.perf_counter()
 
-        # Capture the current ContextVar state (including trace_id) so that the
-        # executor thread inherits it.  Without this, ContextVar values set on
-        # the main thread (e.g. set_trace_id) are invisible to the worker thread
-        # and all tool-call logs would show trace_id="unset".
         ctx: contextvars.Context = contextvars.copy_context()
+        # Bind the per-session cache on the copied context so @cached_tool
+        # decorators can find it on the worker thread.
+        ctx.run(set_session_cache, self._tool_cache)
+
+        # Reset the agent's state context for this turn.  The hook populated
+        # by ``ToolBudgetHookProvider`` will read it on every tool call.
+        state = self.agent.state_context
+        state.reset(trace_id=get_trace_id())
 
         def _invoke() -> object:
-            # threading.local is per-thread; reset here so each agent invocation
-            # starts with a fresh counter regardless of thread reuse.
-            tool_call_counter.count = 0
-            tool_call_counter.limit = max_calls
-            return ctx.run(self.agent, full_input)
+            """Run the agent inside the copied context and roll up metrics."""
+            hits_before = self._tool_cache.hits
+            try:
+                return ctx.run(self.agent, full_input)
+            finally:
+                self.metrics.tool_calls_made += state.tool_call_count
+                self.metrics.cache_hits += self._tool_cache.hits - hits_before
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_invoke)
@@ -331,24 +429,26 @@ class Orchestrator:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         self.metrics.llm_latency_ms += elapsed_ms
 
+        # Strands ``accumulated_usage`` is cumulative across the session, so
+        # we assign rather than add.  Backends without cache-control support
+        # (e.g. local vLLM) leave the field absent/zero.
+        usage = getattr(
+            getattr(self.agent, "event_loop_metrics", None), "accumulated_usage", None
+        )
+        if isinstance(usage, dict):
+            self.metrics.cache_read_input_tokens = int(usage.get("cacheReadInputTokens", 0) or 0)
+
         raw_response = str(response)
         logger.debug(
             "orchestrator: raw LLM response",
             extra={"data": {"response_len": len(raw_response), "response": raw_response}},
         )
-        return _strip_thinking(raw_response)
+        return raw_response
 
     def _check_context_budget(self, full_input: str) -> None:
         """
         Emit a critical alert when the injected turn input approaches the
-        configured character limit (§5b).
-
-        Note: Strands manages conversation history internally so we cannot
-        truncate it here.  This alert signals that the operator should either
-        increase max_context_chars or that summarisation is needed.
-
-        ``max_context_chars`` is already a character limit — do NOT multiply
-        it by CHARS_PER_TOKEN here; that would inflate the threshold 4×.
+        configured character limit.
         """
         budget = self.config.max_context_chars
         if len(full_input) > budget * CONTEXT_BUDGET_ALERT_THRESHOLD:
@@ -363,12 +463,31 @@ class Orchestrator:
             )
 
     def _close_session(self) -> None:
-        """Collect final storage metrics then trigger post-session hook."""
+        """Flush remaining dialog, collect storage metrics, run post-session hook."""
         logger.debug("orchestrator: closing session")
+        conv_manager = getattr(self.agent, "conversation_manager", None)
+        flush = getattr(conv_manager, "flush", None)
+        if callable(flush):
+            try:
+                flush(self.agent)
+            except Exception as exc:
+                logger.warning(
+                    "orchestrator: conversation_manager.flush failed",
+                    extra={"data": {"error": str(exc)}},
+                )
+        self._flush_metrics_snapshot()
+
+    def _flush_metrics_snapshot(self) -> None:
+        """
+        Append the current metrics dict to ``metrics.jsonl``.
+
+        Called periodically from the main loop and on graceful failure so
+        that an abrupt process exit (no ``exit`` command, terminal closed)
+        loses at most ``METRICS_FLUSH_INTERVAL_TURNS`` turns of metrics.
+        Each call appends one line — the file is a time-series; the last
+        line is the most current snapshot.
+        """
         metrics_dict = self.metrics.to_dict()
-        metrics_dict["index_size_bytes"] = self._dir_size(
-            os.path.dirname(self.config.index_path) or "."
-        )
         metrics_dict["storage_size_bytes"] = self._dir_size(self.config.memory_root)
         try:
             self.post_session_hook.run(metrics=metrics_dict)
@@ -377,6 +496,72 @@ class Orchestrator:
                 "orchestrator: post-session hook error",
                 extra={"data": {"error": str(exc)}},
             )
+
+    def _resolve_archive_path(self) -> Optional[str]:
+        """Return the per-session archive jsonl path, or None when unavailable.
+
+        Returns ``None`` when ``config.memory_root`` is missing or non-string
+        (e.g. ``MagicMock`` in unit tests that don't exercise this code path).
+        """
+        root = getattr(self.config, "memory_root", None)
+        if not isinstance(root, str) or not root:
+            return None
+        filename = ARCHIVE_SESSION_FILENAME_FORMAT.format(session_id=self.session_id)
+        return os.path.join(root, ARCHIVE_DIR_NAME, filename)
+
+    def _append_raw_turn(
+        self,
+        user_input: str,
+        response_text: str,
+        tool_names: List[str],
+        timestamp: str,
+    ) -> None:
+        """Append one full-fidelity turn record to the per-session archive.
+
+        Failures are swallowed with a warning so a disk-full or permission
+        problem cannot abort the chat loop.  No-op when the archive path
+        could not be resolved (see :py:meth:`_resolve_archive_path`).
+        """
+        if not self._archive_path:
+            return
+        record = {
+            "timestamp": timestamp,
+            "trace_id": get_trace_id(),
+            "session_id": self.session_id,
+            "user": user_input,
+            "assistant": response_text,
+            "tools_invoked": list(tool_names),
+        }
+        try:
+            os.makedirs(os.path.dirname(self._archive_path), exist_ok=True)
+            with open(self._archive_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.warning(
+                "orchestrator: failed to append raw turn to archive",
+                extra={"data": {"error": str(exc), "path": self._archive_path}},
+            )
+
+    def _per_tool_budget(self) -> dict:
+        """
+        Return the per-tool call budget dict, pulled from the active Config.
+
+        Missing config fields fall back to the module defaults so tests that
+        use ``MagicMock(spec=Config)`` without setting every knob keep working.
+        """
+        return {
+            "web_search": getattr(
+                self.config, "tool_budget_web_search", DEFAULT_TOOL_BUDGET_WEB_SEARCH
+            ),
+            "run_python": getattr(
+                self.config, "tool_budget_run_python", DEFAULT_TOOL_BUDGET_RUN_PYTHON
+            ),
+            "delegate_to_research": getattr(
+                self.config,
+                "tool_budget_delegate_to_research",
+                DEFAULT_TOOL_BUDGET_DELEGATE_TO_RESEARCH,
+            ),
+        }
 
     @staticmethod
     def _dir_size(path: str) -> int:

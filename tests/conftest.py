@@ -16,14 +16,22 @@ LLM integration tests expect a running vLLM (or OpenAI-compatible) endpoint.
 The URL is taken from LLM_API_ENDPOINT in .env (default: http://localhost:8000/v1).
 
 The ``llm_available`` fixture skips tests when the endpoint is unreachable.
+
+Confirmation mode
+-----------------
+``auto`` confirmation resolves to ``interactive`` when stdin is a TTY.  Under
+``pytest`` stdin is typically still a TTY, which would cause
+``@requires_confirmation`` tools to block on ``input()``.  The autouse
+``_deny_confirmations`` fixture forces ``non_interactive`` (deny-by-default)
+for every test unless the test explicitly overrides it.
 """
 
-import json
 import os
-import time
 from urllib import request as urllib_request
 
 import pytest
+
+from src.tools.confirm import reset_confirmation_mode, set_confirmation_mode
 
 REDIS_TEST_PORT = 6380
 
@@ -118,4 +126,25 @@ def llm_endpoint_or_none():
     except Exception:
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# Confirmation mode — deny by default during tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _deny_confirmations():
+    """
+    Force ``non_interactive`` (deny-by-default) confirmation mode for tests.
+
+    Without this, ``@requires_confirmation``-decorated tools would attempt to
+    read from stdin when pytest is attached to a TTY, hanging the suite.
+    Tests that need interactive behaviour can override by calling
+    ``set_confirmation_mode("interactive")`` inside the test body.
+    """
+    token = set_confirmation_mode("non_interactive")
+    try:
+        yield
+    finally:
+        reset_confirmation_mode(token)
 
